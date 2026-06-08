@@ -2,7 +2,7 @@
 
 Persistent memory manager for LLM conversations. SQLite-backed, zero external dependencies.
 
-v0.3.0 — SQLite-backed semantic memories + roleplay memory system.
+v0.3.0 — SQLite-backed semantic memories with ChromaDB search.
 
 ## Quick start
 
@@ -38,7 +38,7 @@ for m in history:
 |--------|-------------|
 | `add_message(role, content)` | `user`/`assistant` → messages table. `system` → updates core prompt |
 | `get_history(max_messages=10, extra_context="")` | Returns `build_system_prompt()` + last N-1 messages |
-| `build_system_prompt(extra_context="")` | Core prompt + [USER_MEMORY] + saved prompts + [ASSISTANT_MEMORY] + memory rules |
+| `build_system_prompt(extra_context="")` | Core prompt + saved prompts + long-term memories + memory rules |
 | `get_system_prompt()` | Returns only the core prompt (`_active`) |
 | `count_messages()` | Total messages stored |
 
@@ -72,7 +72,7 @@ Each `Message` includes an `id` field matching the DB row ID.
 
 ## Semantic Memory (ChromaDB + SQLite)
 
-The `SemanticMemory` module detects rememberable information using rules (no LLM) and stores it in both ChromaDB (search index) and SQLite (source of truth).
+Detects rememberable information from both user and assistant messages using rules (no LLM). Stores in ChromaDB (search index) + SQLite (source of truth).
 
 ### Requirements
 
@@ -83,7 +83,6 @@ pip install chromadb
 ### Quick start
 
 ```python
-import sqlite3
 from v_memory_manager import SemanticMemory, MemoryManager
 
 mem = MemoryManager()
@@ -92,18 +91,19 @@ mem.create_memory_db("chat.db")
 sem = SemanticMemory(
     persist_dir="./chroma_db",
     sqlite_conn=mem._conn,
-    namespace="normal",
-    scope="user",
 )
 
 # Analyze without saving
 result = sem.analyze("Me gustan las galletas de chocolate")
 print(result.should_remember, result.confidence)
 
-# Save automatically
+# Save automatically (returns None if not rememberable)
 mid = sem.remember("Prefiero Python")
 if mid:
     print(f"Saved: {mid}")
+
+# Force save
+sem.remember_force("Al usuario le gusta Python", tags=["python"])
 
 # Search by similarity
 results = sem.search("lenguaje de programacion")
@@ -123,7 +123,7 @@ sem.list_memories()
 sem.get_memory(memory_id)
 ```
 
-### Rule-based detection
+### Rule-based detection (no LLM)
 
 | Step | Description |
 |---|---|
@@ -135,11 +135,13 @@ sem.get_memory(memory_id)
 
 ### Status flow
 
-| Confidence | Status | Retrieved |
+| Confidence | Status | Retrieved in search |
 |---|---|---|
 | >= 0.75 | `active` | Yes |
-| 0.40–0.74 | `pending_review` | No |
-| < 0.40 | — | Ignored |
+| 0.40–0.74 | `pending_review` | Yes |
+| < 0.40 | — | Not saved |
+
+Both user and assistant messages are analyzed and saved when they contain rememberable information (preferences, project facts, environment details, etc.).
 
 ### Operations
 
@@ -149,128 +151,24 @@ sem.get_memory(memory_id)
 | `archive` | UPDATE status | update status |
 | `forget` | UPDATE status='deleted' | delete (soft) |
 | `purge` | DELETE | delete (hard) |
-| `get_memory` | SELECT | — |
-| `list_memories` | SELECT | — |
+| `get_memory` | SELECT by memory_id | — |
+| `list_memories` | SELECT by namespace | — |
 | `search` | — | query |
-
-## Roleplay Memory (ChromaDB + SQLite)
-
-Separate system for narrative/fictional memories. Detects character facts from both user and assistant messages using regex patterns.
-
-### Quick start
-
-```python
-from v_memory_manager import RoleplaySemanticMemory
-
-rp = RoleplaySemanticMemory(
-    persist_dir="./chroma_db",
-    sqlite_conn=mem._conn,
-    user_character_id="mikaela",
-    assistant_character_id="juan",
-)
-
-# Auto-detect from message
-ids = rp.remember("Mi color favorito es rojo", source_role="assistant")
-
-# Force save
-rp.remember_force(
-    content="Juan fue exiliado de la capital.",
-    owner_type="assistant_character",
-    character_id="juan",
-    memory_type="character_backstory",
-    fact_key="exile_origin",
-    fact_value="exiliado de la capital",
-)
-
-# Search by character
-rp.search_user("miedo")
-rp.search_character("color")
-rp.search_world("capital")
-
-# Build prompt context
-ctx = rp.build_context("miedo", n_results=3)
-```
-
-### Detected patterns
-
-| Pattern | memory_type | Conflict policy |
-|---|---|---|
-| `mi color favorito es...` | `character_preference` | replace |
-| `me llamo...`, `mi nombre es...` | `character_identity` | pending_review |
-| `vengo de...`, `nací en...` | `character_backstory` | pending_review |
-| `tengo miedo de...` | `character_fear` | pending_review |
-| `prometo...`, `juro...` | `promise` | pending_review |
-| `tengo X años` | `character_identity` | pending_review |
-
-### ChromaDB collections
-
-| Collection | Stores |
-|---|---|
-| `roleplay_user_character_memories` | Facts about the user's character |
-| `roleplay_assistant_character_memories` | Facts about the AI character + world lore |
-| `roleplay_world_memories` | Shared world lore |
-
-### Contradictions
-
-Matching `character_id + fact_key` with a different value triggers a policy:
-
-| memory_type | Action |
-|---|---|
-| `character_preference` | Archive old, save new as canon |
-| `relationship_state` | Archive old, save new as canon |
-| `scene_state` | Archive old, save new as canon |
-| `character_identity` | New saved as `pending_review` |
-| `character_backstory` | New saved as `pending_review` |
-| `world_lore` | New saved as `pending_review` |
-
-## MemoryRouter
-
-Decides between normal and roleplay memory based on a flag.
-
-```python
-from v_memory_manager import MemoryRouter, SemanticMemory, RoleplaySemanticMemory
-
-router = MemoryRouter(semantic=sem, roleplay=rp, roleplay_enabled=False)
-router.set_roleplay_enabled(True)
-
-# Auto-routes based on mode
-router.remember_user("Me gusta Python")
-router.remember_assistant("Mi color favorito es rojo")
-
-# Build context for prompt injection
-ctx = router.build_context("color favorito")
-```
-
-| Mode | `remember_user` | `remember_assistant` | `build_context` returns |
-|---|---|---|---|
-| Normal | `SemanticMemory.remember()` | ignored | `[USER_MEMORY]` block |
-| Roleplay | `RoleplaySemanticMemory.remember(role="user")` | `RoleplaySemanticMemory.remember(role="assistant")` | `[ROLEPLAY_*]` blocks |
 
 ## System prompt injection
 
-### Normal mode
+When relevant memories are found, they are injected into the system prompt:
 
 ```
 [USER_MEMORY]
 - Preferencia del usuario: Le gustan las galletas de chocolate
 
 [USO DE MEMORIA]
-- USER_MEMORY describe al usuario.
-- Si USER_MEMORY contiene la respuesta, responde directamente.
-```
-
-### Roleplay mode
-
-```
-[ROLEPLAY_USER_CHARACTER_MEMORY]
-- mikaela tiene miedo de los espejos.
-
-[ROLEPLAY_ASSISTANT_CHARACTER_MEMORY]
-- juan tiene como color favorito el rojo.
-
-[ROLEPLAY MEMORY RULES]
-- Las memorias pertenecen al mundo ficticio.
-- No las confundas con datos reales del usuario.
+- USER_MEMORY describe al usuario que está conversando.
+- ASSISTANT_MEMORY describe al asistente.
+- Si el usuario pregunta por "mi", "me", "yo", "mis gustos", "mi nombre" o "mi favorito", revisa USER_MEMORY primero.
+- Si USER_MEMORY contiene la respuesta, responde directamente usando esa memoria.
+- No digas "como modelo de lenguaje no tengo preferencias" cuando el usuario pregunta por sus propias preferencias.
 ```
 
 ## Data model (SQLite)
@@ -287,29 +185,30 @@ semantic_memories    -- unified table for ALL semantic memories
 
 | Column | Type | Description |
 |---|---|---|
-| `id` | INTEGER | PK |
-| `memory_id` | TEXT UNIQUE | Stable external ID (`mem_abc123`) |
+| `memory_id` | TEXT UNIQUE | Stable ID (`mem_abc123`) |
 | `chroma_id` | TEXT UNIQUE | ChromaDB document ID |
-| `namespace` | TEXT | `normal` or `roleplay` |
-| `scope` | TEXT | `user`, `project`, `user_character`, etc. |
+| `namespace` | TEXT | `normal` |
+| `scope` | TEXT | `user`, `project`, etc. |
 | `content` | TEXT | Memory content |
 | `original_text` | TEXT | Raw source message |
 | `tags` | TEXT | Comma-separated tags |
 | `confidence` | REAL | Detection confidence 0–1 |
 | `importance` | REAL | Relevance 0–1 |
-| `memory_type` | TEXT | `explicit`, `preference`, `character_identity`, etc. |
+| `memory_type` | TEXT | `explicit`, `preference`, etc. |
 | `status` | TEXT | `active`, `pending_review`, `archived`, `deleted` |
 | `source` | TEXT | `auto` or `manual` |
 | `source_message_ids` | TEXT | Traceability to source messages |
-| `owner_type` | TEXT | `user_character`, `assistant_character` (roleplay) |
-| `character_id` | TEXT | Character name (roleplay) |
-| `source_role` | TEXT | `user` or `assistant` (roleplay) |
-| `canon_status` | TEXT | `canon`, `soft_canon`, `temporary`, `contradicted` |
-| `fact_key` | TEXT | `favorite_color`, `name`, `fear`, etc. (roleplay) |
-| `fact_value` | TEXT | Extracted value (roleplay) |
-| `scene_id` | TEXT | Scene tracking (roleplay) |
-| `world_id` | TEXT | World tracking (roleplay) |
-| `expires_scope` | TEXT | `never`, `end_of_scene`, `end_of_day` |
+| `created_at` | TEXT | ISO 8601 |
+| `updated_at` | TEXT | ISO 8601 |
+| `owner_type` | TEXT | (roleplay, unused) |
+| `character_id` | TEXT | (roleplay, unused) |
+| `source_role` | TEXT | (roleplay, unused) |
+| `canon_status` | TEXT | (roleplay, unused) |
+| `fact_key` | TEXT | (roleplay, unused) |
+| `fact_value` | TEXT | (roleplay, unused) |
+| `scene_id` | TEXT | (roleplay, unused) |
+| `world_id` | TEXT | (roleplay, unused) |
+| `expires_scope` | TEXT | (roleplay, unused) |
 
 ## Schema migration
 
@@ -325,17 +224,18 @@ Auto-migrated on `load_memory_db()`.
 
 | Command | Description |
 |---|---|
-| `/remember <text>` | Save explicit memory |
+| `/remember <text>` | Force save a memory |
 | `/memories` | List all memories |
 | `/search <query>` | Semantic search |
 | `/forget <id>` | Delete a memory |
-| `/roleplay` | Toggle roleplay mode ON/OFF |
 | `/clear` | Clear message history |
 | `/prompt <text>` | Change system prompt |
 | `/save <name>` | Save prompt |
 | `/load <name>` | Load prompt |
 | `/show_prompt` | Show built system prompt |
 | `/exit` | Exit |
+
+Memories are saved automatically from both user and assistant messages when they contain rememberable information.
 
 ## Integration with v_llama
 
@@ -362,4 +262,4 @@ mem.add_message("user", user)
 mem.add_message("assistant", res.content)
 ```
 
-See `examples/console_chat.py` for a complete interactive chat with model selection, session management, streaming, roleplay, and semantic memory.
+See `examples/console_chat.py` for a complete interactive chat with model selection, session management, streaming, and semantic memory.
