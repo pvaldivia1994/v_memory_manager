@@ -268,7 +268,7 @@ class SemanticMemory:
             where={
                 "$and": [
                     {"namespace": {"$eq": self._namespace}},
-                    {"status": {"$eq": "active"}},
+                    {"status": {"$in": ["active", "pending_review"]}},
                 ],
             },
         )
@@ -357,7 +357,7 @@ class SemanticMemory:
                 "$and": [
                     {"namespace": {"$eq": self._namespace}},
                     {"user_id": {"$eq": self._user_id}},
-                    {"status": {"$eq": "active"}},
+                    {"status": {"$in": ["active", "pending_review"]}},
                 ],
             },
         )

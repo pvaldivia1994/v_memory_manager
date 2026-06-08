@@ -31,7 +31,7 @@ sys.path.insert(0, str(_ROOT))
 for k in list(sys.modules):
     if k.startswith("src"):
         del sys.modules[k]
-from src import MemoryManager, SemanticMemory, MemoryRouter, RoleplaySemanticMemory
+from src import MemoryManager, SemanticMemory
 
 DIM = "\033[90m"
 CYAN = "\033[36m"
@@ -166,22 +166,13 @@ def main():
             persist_dir=str(_ROOT / ".chatdb" / "chroma"),
             sqlite_conn=mem._conn,
         )
-        rp = RoleplaySemanticMemory(
-            persist_dir=str(_ROOT / ".chatdb" / "chroma"),
-            sqlite_conn=mem._conn,
-            user_character_id="usuario",
-            assistant_character_id="asistente",
-        )
-        router = MemoryRouter(semantic=sem, roleplay=rp, roleplay_enabled=False)
     except Exception as e:
         print(f"{DIM}[SemanticMemory no disponible: {e}]{RESET}")
         sem = None
-        rp = None
-        router = None
 
     system_prompt = _ask_system_prompt(mem)
 
-    print(f"\nComandos: /clear  /prompt <texto>  /save <nombre>  /load <nombre>  /show_prompt  /remember <texto>  /memories  /search <q>  /forget <id>  /roleplay  /exit\n")
+    print(f"\nComandos: /clear  /prompt <texto>  /save <nombre>  /load <nombre>  /show_prompt  /remember <texto>  /memories  /search <q>  /forget <id>  /exit\n")
 
     stream = not args.no_stream
 
@@ -258,34 +249,21 @@ def main():
                 continue
 
             elif cmd == "/forget":
-                if not router:
-                    print("[Sistema de memoria no disponible]")
+                if not sem:
+                    print("[SemanticMemory no disponible]")
                     continue
                 if len(parts) < 2:
                     print("[Uso: /forget <id>]")
                     continue
-                router.forget(parts[1])
+                sem.forget(parts[1])
                 print(f"[Memoria eliminada: {parts[1]}]")
                 continue
 
-            elif cmd == "/roleplay":
-                if not router:
-                    print("[Sistema de memoria no disponible]")
-                    continue
-                enabled = not router.roleplay_enabled
-                router.set_roleplay_enabled(enabled)
-                status = "ON" if enabled else "OFF"
-                print(f"[Modo roleplay: {status}]")
-                if enabled:
-                    print(f"  Personaje del usuario: {rp._user_char_id}")
-                    print(f"  Personaje del asistente: {rp._assistant_char_id}")
-                continue
-
             elif cmd == "/memories":
-                if not router:
-                    print("[Sistema de memoria no disponible]")
+                if not sem:
+                    print("[SemanticMemory no disponible]")
                     continue
-                memories = router.list_memories(limit=50)
+                memories = sem.list_memories(limit=50)
                 if not memories:
                     print("[No hay memorias guardadas]")
                     continue
@@ -293,24 +271,25 @@ def main():
                 for m in memories:
                     tag_str = f" [{', '.join(m.tags)}]" if m.tags else ""
                     status_str = f" ({m.status})" if m.status != "active" else ""
-                    prefix = f"[{m.namespace}]" if m.namespace != "normal" else ""
-                    print(f"  {prefix} {m.memory_id[:16]}: {m.content[:80]}{tag_str}{status_str}")
+                    print(f"  {m.memory_id[:16]}: {m.content[:80]}{tag_str}{status_str}")
                 print(f"{DIM}─────────────────────────{RESET}")
                 continue
 
             elif cmd == "/search":
-                if not router:
-                    print("[Sistema de memoria no disponible]")
+                if not sem:
+                    print("[SemanticMemory no disponible]")
                     continue
                 if len(parts) < 2:
                     print("[Uso: /search <consulta>]")
                     continue
-                ctx = router.build_context(parts[1], n_results=5)
+                ctx = sem.search(parts[1], n_results=5)
                 if not ctx:
                     print("[Sin resultados]")
                     continue
                 print(f"\n{DIM}── Resultados para: {parts[1]} ──{RESET}")
-                print(ctx)
+                for m in ctx:
+                    tag_str = f" [{', '.join(m.tags)}]" if m.tags else ""
+                    print(f"  {m.content[:100]}{tag_str}")
                 print(f"{DIM}──────────────────────────{RESET}")
                 continue
 
@@ -321,12 +300,12 @@ def main():
         # ── Chat ────────────────────────────────────────────
 
         extra_context = ""
-        if router:
-            extra_context = router.build_context(user, n_results=3)
-            if extra_context:
-                sections = extra_context.count("[ROLEPLAY")
-                memories_count = max(1, extra_context.count("- ") - 3)
-                print(f"{DIM}[{sections} secciones | {memories_count} memorias recuperadas]{RESET}")
+        if sem:
+            results = sem.search(user, n_results=3)
+            if results:
+                lines = "\n".join(f"- {m.content}" for m in results)
+                extra_context = lines
+                print(f"{DIM}[{len(results)} memorias recuperadas]{RESET}")
 
         full_system = mem.build_system_prompt(extra_context=extra_context)
         if extra_context:
@@ -365,14 +344,13 @@ def main():
             if full:
                 mem.add_message("user", user)
                 mem.add_message("assistant", full)
-                if router:
-                    mid = router.remember_user(user)
+                if sem:
+                    mid = sem.remember(user)
                     if mid:
                         print(f"{DIM}[Memoria guardada: {mid}]{RESET}")
-                    if router.roleplay_enabled:
-                        rp_ids = router.remember_assistant_raw(full)
-                        if rp_ids:
-                            print(f"{DIM}[{len(rp_ids)} memorias roleplay del asistente]{RESET}")
+                    mid2 = sem.remember(full)
+                    if mid2:
+                        print(f"{DIM}[Memoria del asistente: {mid2}]{RESET}")
         else:
             res = llm.chat(system=full_system, user=user, history=history, stream=False)
             if not res.success:
@@ -388,14 +366,13 @@ def main():
                 if res.content:
                     mem.add_message("user", user)
                     mem.add_message("assistant", res.content)
-                    if router:
-                        mid = router.remember_user(user)
+                    if sem:
+                        mid = sem.remember(user)
                         if mid:
                             print(f"{DIM}[Memoria guardada: {mid}]{RESET}")
-                        if router.roleplay_enabled:
-                            rp_ids = router.remember_assistant_raw(res.content)
-                            if rp_ids:
-                                print(f"{DIM}[{len(rp_ids)} memorias roleplay del asistente]{RESET}")
+                        mid2 = sem.remember(res.content)
+                        if mid2:
+                            print(f"{DIM}[Memoria del asistente: {mid2}]{RESET}")
 
 
 if __name__ == "__main__":
