@@ -2,77 +2,154 @@
 
 ## 1. Propósito
 
-Unificar el almacenamiento de TODAS las memorias semánticas (normales y roleplay) en
-una sola tabla SQLite como source of truth. ChromaDB queda como índice de búsqueda
-semántica. El borrado/archivado se hace por ID de SQLite, que contiene el `chroma_id`
-para eliminar también de ChromaDB.
+Unificar TODAS las memorias semánticas (normales + roleplay) en SQLite como source of truth.
+ChromaDB queda solo como índice de búsqueda semántica. Borrar/archivar se hace por memory_id
+desde SQLite, que contiene el chroma_id para sincronizar ChromaDB.
 
-## 2. Stack técnico
+## 2. Principios
+
+```
+SQLite manda.
+Chroma solo busca.
+```
+
+## 3. Stack técnico
 
 | Componente | Tecnología |
 |---|---|
-| Source of truth | SQLite (tabla `semantic_memories` en la DB de MemoryManager) |
+| Source of truth | SQLite (tabla `semantic_memories`) |
 | Search index | ChromaDB (colecciones separadas por namespace) |
-| Detección normal | Reglas + scoring (existente en `semantic_memory.py`) |
-| Detección roleplay | Patrones regex (nuevo en `roleplay_memory.py`) |
+| Detección normal | Reglas + scoring (`semantic_memory.py`) |
+| Detección roleplay | Patrones regex (`roleplay_memory.py`) |
 
-## 3. Arquitectura
-
-```
-memory/
-├── semantic_memory.py      # existente — memoria real del usuario
-├── roleplay_memory.py      # nueva — memoria ficticia narrativa
-├── memory_models.py        # nueva — modelos compartidos
-└── memory_router.py        # nueva — router normal/roleplay
-```
-
-## 4. Tabla SQLite unificada — `semantic_memories`
-
-Una sola tabla para TODO: memorias normales + roleplay. Se diferencian por `namespace`.
+## 4. Tabla SQLite — `semantic_memories`
 
 ```sql
 CREATE TABLE IF NOT EXISTS semantic_memories (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    chroma_id       TEXT NOT NULL UNIQUE,
-    namespace       TEXT NOT NULL DEFAULT 'user',  -- 'user' | 'roleplay'
+    memory_id       TEXT NOT NULL UNIQUE,
+    chroma_id       TEXT UNIQUE,
+
+    namespace       TEXT NOT NULL DEFAULT 'normal',
+    scope           TEXT NOT NULL DEFAULT 'user',
+
     content         TEXT NOT NULL,
+    original_text   TEXT NOT NULL DEFAULT '',
     tags            TEXT NOT NULL DEFAULT '',
+
     confidence      REAL NOT NULL DEFAULT 1.0,
+    importance      REAL NOT NULL DEFAULT 0.5,
+
     memory_type     TEXT NOT NULL DEFAULT '',
-    status          TEXT NOT NULL DEFAULT 'active', -- active | pending_review | archived | deleted
+    status          TEXT NOT NULL DEFAULT 'active',
     source          TEXT NOT NULL DEFAULT 'auto',
+
+    source_message_ids TEXT NOT NULL DEFAULT '',
+
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
 
-    -- Roleplay-specific (vacíos para namespace='user')
-    owner_type      TEXT NOT NULL DEFAULT '',       -- user_character | assistant_character | shared_world
+    -- Roleplay-specific
+    owner_type      TEXT NOT NULL DEFAULT '',
     character_id    TEXT NOT NULL DEFAULT '',
-    source_role     TEXT NOT NULL DEFAULT '',       -- user | assistant
+    source_role     TEXT NOT NULL DEFAULT '',
     canon_status    TEXT NOT NULL DEFAULT 'canon',
     fact_key        TEXT NOT NULL DEFAULT '',
     fact_value      TEXT NOT NULL DEFAULT '',
     scene_id        TEXT NOT NULL DEFAULT '',
-    world_id        TEXT NOT NULL DEFAULT ''
+    world_id        TEXT NOT NULL DEFAULT '',
+    expires_scope   TEXT NOT NULL DEFAULT 'never'
 );
 
-CREATE INDEX idx_semantic_memories_chroma ON semantic_memories(chroma_id);
-CREATE INDEX idx_semantic_memories_namespace ON semantic_memories(namespace, status);
+CREATE INDEX IF NOT EXISTS idx_semantic_memories_memory_id
+ON semantic_memories(memory_id);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_memories_chroma_id
+ON semantic_memories(chroma_id);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_memories_ns_scope_status
+ON semantic_memories(namespace, scope, status);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_memories_rp_fact
+ON semantic_memories(world_id, character_id, fact_key, status, canon_status);
 ```
 
-### Beneficios de la tabla unificada
+### Namespaces
 
-| Operación | Antes (solo ChromaDB) | Después (SQLite + ChromaDB) |
+```
+normal                 → memorias reales del usuario
+roleplay               → memorias ficticias
+```
+
+### Scopes
+
+```
+user_profile
+user_preference
+project
+user_character         → personaje del usuario en roleplay
+assistant_character    → personaje IA en roleplay
+shared_world           → lore compartido
+relationship           → relación entre personajes
+scene_state            → estado temporal de escena
+```
+
+### Status flow
+
+```
+active ↔ archived ↘
+pending_review → active (tras revisión)
+deleted (soft, se borra de Chroma pero queda en SQLite)
+```
+
+### Campos clave
+
+| Campo | Descripción |
+|---|---|
+| `memory_id` | ID estable externo (`mem_abc123`). No depende de Chroma. |
+| `chroma_id` | ID en ChromaDB. Puede ser igual a `memory_id` o diferente tras reindex. |
+| `namespace` | `normal` \| `roleplay` |
+| `scope` | Agrupa memorias por contexto semántico |
+| `importance` | 0.0–1.0. Distinto de `confidence`. `confidence` = qué tan seguro estoy de la detección. `importance` = qué tan relevante es para respuestas futuras. |
+| `canon_status` | `canon` \| `soft_canon` \| `temporary` \| `contradicted` |
+| `expires_scope` | `never` \| `end_of_scene` \| `end_of_day` \| `end_of_chapter` |
+| `source_message_ids` | Trazabilidad a mensajes originales |
+
+## 5. Operaciones CRUD
+
+| Operación | SQLite | ChromaDB |
 |---|---|---|
-| Listar memorias | `collection.get()` sin filtros potentes | `SELECT * FROM semantic_memories WHERE namespace='user'` |
-| Buscar por ID | No tenía ID estable | `chroma_id` propio, búsqueda por PK |
-| Borrar | `collection.delete(ids=[...])` | `DELETE FROM semantic_memories WHERE id=?` + `collection.delete(ids=[chroma_id])` |
-| Editar metadata | Update complejo en Chroma | `UPDATE semantic_memories SET ... WHERE id=?` + sync a Chroma |
-| Migrar namespace | No aplica | Cambiar `namespace` en SQLite |
-| Auditoría | No había historial | `updated_at`, `status` con `deleted` (soft-delete opcional) |
+| `remember` | INSERT | add |
+| `archive` | UPDATE status='archived' | update status |
+| `forget` | UPDATE status='deleted' | delete (libera espacio) |
+| `purge` | DELETE físico | delete |
+| `get_memory` | SELECT por memory_id | — |
+| `list_memories` | SELECT por namespace/scope/status | — |
+| `search` | — | query (filtra por namespace + status) |
 
-## 5. Cambios en `SemanticMemory` (existente)
+### forget vs purge
 
-### 5.1. Constructor ahora acepta `sqlite_conn`
+```
+forget(memory_id) → soft: status='deleted', borra de Chroma pero SQLite conserva el registro
+purge(memory_id)  → hard: DELETE físico de SQLite + Chroma
+```
+
+## 6. Arquitectura de archivos
+
+```
+src/
+├── semantic_memory.py      # existente — refactorizada para usar SQLite
+├── roleplay_memory.py      # nueva — RoleplaySemanticMemory
+├── memory_models.py        # nueva — dataclasses compartidas
+├── memory_router.py        # nueva — router normal/roleplay
+├── db.py                   # existente — schema v3 + migración
+├── memory.py               # existente — MemoryManager
+└── __init__.py             # existente — exports
+```
+
+## 7. `SemanticMemory` — cambios
+
+### 7.1. Constructor
 
 ```python
 class SemanticMemory:
@@ -81,107 +158,113 @@ class SemanticMemory:
         persist_dir: str = "./chroma_db",
         sqlite_conn: sqlite3.Connection | None = None,
         user_id: str = "default",
-        namespace: str = "user",
+        namespace: str = "normal",
+        scope: str = "user",
     )
 ```
 
-### 5.2. `_store()` ahora escribe en SQLite + ChromaDB
+### 7.2. `_store()` escribe en SQLite + ChromaDB
 
 ```python
-def _store(self, result, source, original_text=""):
-    # 1. ChromaDB (búsqueda)
-    chroma_id = self._insert_chroma(result)
+def _store(self, result, source, original_text="", msg_ids=""):
+    memory_id = f"mem_{uuid.hex[:16]}"
+    chroma_id = memory_id
 
-    # 2. SQLite (source of truth)
-    self._insert_sqlite(chroma_id, result, source, original_text)
+    # ChromaDB
+    self.collection.add(
+        ids=[chroma_id],
+        documents=[result.content],
+        metadatas=[{
+            "namespace": self._namespace,
+            "scope": self._scope,
+            "status": status,
+            "confidence": result.confidence,
+            "user_id": self._user_id,
+            "tags": tags_str,
+        }],
+    )
 
-    return chroma_id
+    # SQLite
+    self._conn.execute("""
+        INSERT INTO semantic_memories
+        (memory_id, chroma_id, namespace, scope, content, original_text,
+         tags, confidence, importance, memory_type, status, source,
+         source_message_ids)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (...))
+
+    return memory_id
 ```
 
-### 5.3. CRUD contra SQLite
-
-| Método | Cambio |
-|---|---|
-| `get_memory(memory_id)` | Ahora busca por `chroma_id` en SQLite |
-| `forget(memory_id)` | `DELETE FROM semantic_memories WHERE chroma_id=?` + `collection.delete(ids=[chroma_id])` |
-| `archive(memory_id)` | `UPDATE semantic_memories SET status='archived' WHERE chroma_id=?` |
-| `list_memories(limit)` | `SELECT * FROM semantic_memories WHERE namespace=? AND status != 'deleted'` |
-| `search(query, n_results)` | ChromaDB igual, pero filtra por `namespace` + `status='active'` |
-
-### 5.4. Namespace en ChromaDB metadata
-
-Todas las colecciones de ChromaDB incluyen `namespace` en metadata para poder filtrar:
+### 7.3. `forget()` → soft delete
 
 ```python
-metadatas=[{
-    "namespace": self._namespace,   # "user" o "roleplay"
-    "user_id": self._user_id,
-    ...
-}]
+def forget(self, memory_id: str) -> None:
+    row = self._conn.execute(
+        "SELECT chroma_id FROM semantic_memories WHERE memory_id = ?",
+        (memory_id,),
+    ).fetchone()
+    if not row:
+        return
+    self.collection.delete(ids=[row[0]])
+    self._conn.execute(
+        "UPDATE semantic_memories SET status='deleted', updated_at=datetime('now') WHERE memory_id=?",
+        (memory_id,),
+    )
+    self._conn.commit()
 ```
 
-## 6. Clase `RoleplaySemanticMemory`
+### 7.4. `purge()` — borrado físico
 
-### 6.1. Constructor
+```python
+def purge(self, memory_id: str) -> None:
+    row = self._conn.execute(
+        "SELECT chroma_id FROM semantic_memories WHERE memory_id = ?", (memory_id,)
+    ).fetchone()
+    if row and row[0]:
+        self.collection.delete(ids=[row[0]])
+    self._conn.execute("DELETE FROM semantic_memories WHERE memory_id = ?", (memory_id,))
+    self._conn.commit()
+```
+
+## 8. `RoleplaySemanticMemory`
+
+### 8.1. Constructor
 
 ```python
 class RoleplaySemanticMemory:
     def __init__(
         self,
         persist_dir: str = "./chroma_db",
-        sqlite_conn: sqlite3.Connection | None = None,
+        sqlite_conn: sqlite3.Connection,
         world_id: str = "default_world",
         user_character_id: str = "user_character",
         assistant_character_id: str = "assistant_character",
     )
 ```
 
-- Usa `namespace = "roleplay"` en metadata de ChromaDB
-- Dos collections: `roleplay_user_memories` (owner_type=user_character) y `roleplay_character_memories` (owner_type=assistant_character)
+- `namespace = "roleplay"` en metadata de ChromaDB
+- Dos collections: `roleplay_user_character_memories` y `roleplay_assistant_character_memories`
+- La collection `roleplay_assistant_character_memories` también almacena `scope=shared_world`, `scope=relationship`, `scope=scene_state`
 
-### 6.2. API
+### 8.2. API
 
 | Método | Descripción |
 |---|---|
-| `remember(text, source_role, scene_id, source)` | Analiza con patrones, guarda en SQLite + ChromaDB |
-| `search_user(query, n_results)` | ChromaDB query filtrando por `namespace='roleplay'` + `owner_type='user_character'` |
-| `search_character(query, n_results)` | ChromaDB query filtrando por `namespace='roleplay'` + `owner_type='assistant_character'` |
-| `build_context(query, n_results)` | Construye bloque `[ROLEPLAY_MEMORY]` para el prompt |
-| `get_memory(memory_id)` | Busca por `chroma_id` en SQLite |
-| `forget(memory_id)` | Elimina de SQLite + ChromaDB |
-| `list_memories(limit)` | `SELECT * FROM semantic_memories WHERE namespace='roleplay'` |
+| `remember(text, source_role, scene_id, source)` | Analiza con regex, guarda en SQLite + ChromaDB |
+| `remember_force(content, owner_type, character_id, ...)` | Guarda manualmente sin analizar |
+| `search_user(query, n_results)` | ChromaDB: `namespace=roleplay`, `scope=user_character`, `status=active` |
+| `search_character(query, n_results)` | ChromaDB: `namespace=roleplay`, `scope=assistant_character`, `status=active` |
+| `search_world(query, n_results)` | ChromaDB: `namespace=roleplay`, `scope=shared_world`, `status=active` |
+| `build_context(query, n_results)` | Construye bloques `[ROLEPLAY_*_MEMORY]` para el prompt |
+| `get_memory(memory_id)` | SELECT por memory_id en SQLite |
+| `forget(memory_id)` | Soft delete en SQLite + ChromaDB |
+| `purge(memory_id)` | DELETE físico |
+| `archive(memory_id)` | status = archived |
+| `list_memories(limit)` | SELECT por namespace |
+| `count()` | COUNT por namespace |
 
-### 6.3. Tipos de memoria roleplay
-
-```
-character_identity, character_preference, character_trait,
-character_backstory, character_goal, character_fear,
-relationship_state, promise, inventory, injury,
-world_lore, story_event, scene_state
-```
-
-### 6.4. Dataclasses
-
-```python
-@dataclass
-class RoleplayAnalysisResult:
-    should_remember: bool
-    reason: str
-    confidence: float
-    content: str
-    memory_type: str
-    tags: list[str]
-    owner_type: str          # user_character | assistant_character | shared_world
-    character_id: str
-    source_role: str         # user | assistant
-    canon_status: str        # canon | soft_canon | temporary | contradicted
-    fact_key: str
-    fact_value: str
-    scene_id: str
-    world_id: str
-```
-
-### 6.5. Detección de patrones (sin LLM)
+### 8.3. Patrones de detección
 
 ```python
 ROLEPLAY_PATTERNS = {
@@ -212,53 +295,81 @@ ROLEPLAY_PATTERNS = {
 }
 ```
 
-### 6.6. Contradicciones
+### 8.4. Contradicciones según tipo
 
-- Misma `character_id + fact_key + status=active` → conflicto
-- Si `fact_value` difiere: marcar anterior como `contradicted` (SQLite + ChromaDB)
-- Nueva guarda como `canon`
+| memory_type | Política |
+|---|---|
+| `character_identity` | Nueva → `pending_review`. Anterior conserva canon. |
+| `character_backstory` | Nueva → `pending_review`. Anterior conserva canon. |
+| `character_preference` | Nueva reemplaza a anterior (archiva). |
+| `relationship_state` | Nueva reemplaza a anterior. |
+| `scene_state` | Nueva reemplaza a anterior. |
+| `world_lore` | Nueva → `pending_review`. Anterior conserva canon. |
 
-## 7. `MemoryRouter`
+```python
+CONFLICT_POLICY = {
+    "character_identity": "pending_review",
+    "character_backstory": "pending_review",
+    "character_preference": "replace",
+    "relationship_state": "replace",
+    "scene_state": "replace",
+    "world_lore": "pending_review",
+}
+```
+
+### 8.5. `canon_status`
+
+- `canon`: verdad establecida, usar siempre
+- `soft_canon`: puede cambiar, usar pero con flexibilidad
+- `temporary`: estado de escena, no usar fuera de ella
+- `contradicted`: reemplazada por una versión más reciente
+
+### 8.6. `expires_scope`
+
+| Valor | Significado |
+|---|---|
+| `never` | Memoria permanente |
+| `end_of_scene` | Se archiva al cambiar de escena |
+| `end_of_day` | Se archiva al terminar la sesión |
+| `end_of_chapter` | Se archiva al cambiar de capítulo |
+
+## 9. `MemoryRouter`
 
 ```python
 class MemoryRouter:
-    def __init__(self, semantic: SemanticMemory, roleplay: RoleplaySemanticMemory)
+    def __init__(
+        self,
+        semantic: SemanticMemory,
+        roleplay: RoleplaySemanticMemory,
+        roleplay_enabled: bool = False,
+    )
+
+    def set_roleplay_enabled(self, enabled: bool)
+    def remember_user(self, text: str, msg_id: str = "")
+    def remember_assistant(self, text: str, msg_id: str = "")
+    def build_context(self, query: str) -> str
+    def forget(self, memory_id: str)
+    def get_memory(self, memory_id: str)
+    def list_memories(self, limit: int = 50)
 ```
 
-| Método | Descripción |
-|---|---|
-| `remember_user(text)` | Roleplay → `roleplay.remember(role="user")`. Normal → `semantic.remember(text)` |
-| `remember_assistant(text)` | Roleplay → `roleplay.remember(role="assistant")`. Normal → no guarda |
-| `build_context(query)` | Roleplay → `roleplay.build_context(query)`. Normal → `semantic.search(query)` |
-| `forget(memory_id)` | Busca `chroma_id` en SQLite, borra de ambas DBs |
-| `list_memories(limit)` | Unificado de ambas según namespace |
+| Método | Roleplay ON | Roleplay OFF |
+|---|---|---|
+| `remember_user(text)` | `roleplay.remember(role="user")` | `semantic.remember(text)` |
+| `remember_assistant(text)` | `roleplay.remember(role="assistant")` | No guarda |
+| `build_context(query)` | `roleplay.build_context(query)` | `semantic.search(query)` |
 
-## 8. Flujo `forget(memory_id)`
-
-```python
-def forget(self, memory_id: str) -> None:
-    row = self._conn.execute(
-        "SELECT chroma_id FROM semantic_memories WHERE chroma_id = ?", (memory_id,)
-    ).fetchone()
-    if not row:
-        return
-    chroma_id = row[0]
-    self._collection.delete(ids=[chroma_id])
-    self._conn.execute("DELETE FROM semantic_memories WHERE chroma_id = ?", (chroma_id,))
-    self._conn.commit()
-```
-
-## 9. Inyección en system prompt
+## 10. Inyección en system prompt
 
 ### Modo normal
 
 ```
 [USER_MEMORY]
-- Preferencia del usuario: Le gustan las galletas de chocolate
+- Al usuario le gustan las galletas de chocolate
 
 [USO DE MEMORIA]
-- USER_MEMORY describe al usuario que está conversando.
-- Si USER_MEMORY contiene la respuesta, responde directamente.
+- USER_MEMORY describe al usuario real.
+- Si USER_MEMORY responde la pregunta, responde directamente.
 ```
 
 ### Modo roleplay
@@ -269,37 +380,43 @@ Estás participando en una historia de roleplay.
 Las memorias siguientes pertenecen al mundo ficticio.
 No las confundas con datos reales del usuario.
 
+[REALITY BOUNDARY]
+- USER_MEMORY describe al usuario real (fuera del roleplay).
+- ROLEPLAY_USER_CHARACTER_MEMORY describe al personaje del usuario dentro de la ficción.
+- ROLEPLAY_ASSISTANT_CHARACTER_MEMORY describe al personaje que interpretas.
+- Nunca mezcles estas memorias.
+
 [ROLEPLAY_USER_CHARACTER_MEMORY]
 - Mikaela tiene miedo de los espejos.
 
 [ROLEPLAY_ASSISTANT_CHARACTER_MEMORY]
 - Juan tiene como color favorito el rojo.
 
+[ROLEPLAY_WORLD_MEMORY]
+- La capital está bajo control militar.
+
 [ROLEPLAY MEMORY RULES]
-- Usa estas memorias como canon de la historia.
+- Usa estas memorias como canon.
 - No digas "como modelo de lenguaje" dentro del roleplay.
 ```
 
-## 10. Tareas de implementación
+## 11. Tareas de implementación
 
-1. Agregar tabla `semantic_memories` a `db.py` (schema v3)
-2. Migración v2→v3: `CREATE TABLE IF NOT EXISTS semantic_memories`
-3. Crear `memory_models.py` — dataclasses compartidas (RoleplayAnalysisResult, etc.)
-4. Refactor `SemanticMemory._store()` para escribir también en SQLite
-5. Refactor `SemanticMemory.forget()` para borrar de SQLite + ChromaDB
-6. Refactor `SemanticMemory.get_memory()` para leer de SQLite
-7. Agregar `namespace` a metadata de ChromaDB en `SemanticMemory`
-8. Crear `roleplay_memory.py` — clase RoleplaySemanticMemory
-9. Crear `memory_router.py` — router normal/roleplay
-10. Actualizar `__init__.py`
-11. Agregar comandos roleplay a `console_chat.py`
-12. Actualizar README
-13. Tests
+1. **`db.py`**: schema v3 con `semantic_memories`, migración v2→v3
+2. **`memory_models.py`**: dataclasses (`RoleplayAnalysisResult`, `MemoryRecord` unificado)
+3. **Refactor `SemanticMemory`**: `_store()` escribe SQLite + ChromaDB, `forget()` soft delete, `purge()`, `get_memory()` vía SQLite
+4. **`roleplay_memory.py`**: clase `RoleplaySemanticMemory` con patrones regex, contradicciones, collections separadas
+5. **`memory_router.py`**: router normal/roleplay con flag
+6. **`__init__.py`**: exports actualizados
+7. **`console_chat.py`**: comandos `/remember`, `/memories`, `/forget`, `/roleplay on/off`
+8. **README**: documentación
+9. **Tests**: smoke tests
 
-## 11. Edge cases
+## 12. Edge cases
 
-- **Sin SQLite**: `SemanticMemory` funciona solo con ChromaDB (modo legacy), `RoleplaySemanticMemory` requiere SQLite
-- **Namespace no coincide**: ChromaDB busca por `namespace` + `status`, SQLite filtra igual
-- **Contradicción no resuelta**: nueva como `pending_review`, conservar la canon
-- **Roleplay desactivado**: router no llama a RoleplaySemanticMemory
-- **Migración v2→v3**: solo `CREATE TABLE IF NOT EXISTS semantic_memories`, no rompe nada existente
+- **Sin SQLite**: SemanticMemory funciona solo con ChromaDB (modo legacy). RoleplaySemanticMemory requiere SQLite.
+- **ChromaDB no instalado**: error claro "pip install chromadb"
+- **Reindex de Chroma**: se puede reconstruir desde SQLite porque el `chroma_id` puede regenerarse.
+- **Roleplay sin personajes**: usar character_ids por defecto.
+- **Escena sin ID**: usar `scene_id = ""`, no se trackea por escena.
+- **Contradicción no resuelta**: nueva como `pending_review`, anterior conserva canon.

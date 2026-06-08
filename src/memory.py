@@ -26,6 +26,7 @@ class MemoryManager:
             )
 
         self._conn = sqlite3.connect(path)
+        self._conn.row_factory = sqlite3.Row
         self._db_path = path
         db.init_db(self._conn)
 
@@ -47,6 +48,7 @@ class MemoryManager:
             raise FileNotFoundError(f"DB no encontrada: {path}")
 
         self._conn = sqlite3.connect(path)
+        self._conn.row_factory = sqlite3.Row
         self._db_path = path
         db.verify_schema(self._conn)
 

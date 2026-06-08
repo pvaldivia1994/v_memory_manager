@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 import uuid
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
+
+from .memory_models import AnalysisResult, MemoryRecord
 
 _NOISE = {
     "hola", "buenas", "hey", "ok", "okay", "dale", "perfecto",
@@ -62,28 +64,6 @@ _GENERAL_KEYWORDS: dict[str, list[str]] = {
     "nombre": ["me llamo", "mi nombre es", "llámame"],
     "gustos": ["me gusta", "prefiero", "favorito", "favorita", "me encanta"],
 }
-
-
-@dataclass
-class AnalysisResult:
-    should_remember: bool = False
-    reason: str = ""
-    confidence: float = 0.0
-    content: str = ""
-    memory_type: str = ""
-    tags: list[str] = field(default_factory=list)
-
-
-@dataclass
-class MemoryRecord:
-    id: str = ""
-    content: str = ""
-    tags: list[str] = field(default_factory=list)
-    confidence: float = 0.0
-    memory_type: str = ""
-    status: str = "active"
-    created_at: str = ""
-    source: str = "auto"
 
 
 def is_noise(text: str) -> bool:
@@ -199,10 +179,20 @@ def analyze_text(text: str) -> AnalysisResult:
 
 
 class SemanticMemory:
-    def __init__(self, persist_dir: str = "./chroma_db", user_id: str = "default"):
-        self._collection: Optional["Collection"] = None
+    def __init__(
+        self,
+        persist_dir: str = "./chroma_db",
+        sqlite_conn: Optional[sqlite3.Connection] = None,
+        user_id: str = "default",
+        namespace: str = "normal",
+        scope: str = "user",
+    ):
+        self._collection: Optional[Any] = None
         self._persist_dir = persist_dir
+        self._conn: Optional[sqlite3.Connection] = sqlite_conn
         self._user_id = user_id
+        self._namespace = namespace
+        self._scope = scope
 
     # ── Lifecycle ──────────────────────────────────────────────
 
@@ -212,9 +202,7 @@ class SemanticMemory:
         try:
             import chromadb
         except ImportError:
-            raise ImportError(
-                "chromadb no está instalado. Ejecuta: pip install chromadb"
-            )
+            raise ImportError("chromadb no está instalado. Ejecuta: pip install chromadb")
         client = chromadb.PersistentClient(path=self._persist_dir)
         self._collection = client.get_or_create_collection(
             name="semantic_memories",
@@ -225,6 +213,12 @@ class SemanticMemory:
     def collection(self):
         self._ensure_collection()
         return self._collection
+
+    @property
+    def conn(self):
+        if self._conn is None:
+            raise RuntimeError("SemanticMemory requiere sqlite_conn")
+        return self._conn
 
     def close(self):
         self._collection = None
@@ -237,13 +231,17 @@ class SemanticMemory:
 
     # ── CRUD ───────────────────────────────────────────────────
 
-    def remember(self, text: str, source: str = "auto") -> Optional[str]:
+    def remember(
+        self, text: str, source: str = "auto", msg_ids: str = ""
+    ) -> Optional[str]:
         result = self.analyze(text)
         if not result.should_remember:
             return None
-        return self._store(result, source, text)
+        return self._store(result, source, text, msg_ids)
 
-    def remember_force(self, content: str, tags: Optional[list[str]] = None) -> str:
+    def remember_force(
+        self, content: str, tags: Optional[list[str]] = None
+    ) -> str:
         return self._store(AnalysisResult(
             should_remember=True,
             reason="explicit",
@@ -253,27 +251,37 @@ class SemanticMemory:
             tags=tags or [],
         ), source="manual", original_text=content)
 
-    def _store(self, result: AnalysisResult, source: str, original_text: str = "") -> str:
-        coll = self.collection
-        mem_id = f"mem_{uuid.uuid4().hex[:16]}"
+    def _store(
+        self, result: AnalysisResult, source: str,
+        original_text: str = "", msg_ids: str = "",
+    ) -> str:
+        memory_id = f"mem_{uuid.uuid4().hex[:16]}"
+        chroma_id = memory_id
         now = datetime.now(timezone.utc).isoformat()
-
-        status = "active" if result.confidence >= 0.75 else "pending_review"
         tags_str = ",".join(result.tags) if result.tags else ""
+        status = "active" if result.confidence >= 0.75 else "pending_review"
 
+        coll = self.collection
         existing = coll.query(
             query_texts=[result.content],
             n_results=1,
-            where={"status": {"$eq": "active"}},
+            where={
+                "$and": [
+                    {"namespace": {"$eq": self._namespace}},
+                    {"status": {"$eq": "active"}},
+                ],
+            },
         )
         if existing["distances"] and existing["distances"][0]:
             if existing["distances"][0][0] < 0.1:
                 return existing["ids"][0][0]
 
         coll.add(
-            ids=[mem_id],
+            ids=[chroma_id],
             documents=[result.content],
             metadatas=[{
+                "namespace": self._namespace,
+                "scope": self._scope,
                 "user_id": self._user_id,
                 "tags": tags_str,
                 "confidence": result.confidence,
@@ -284,29 +292,59 @@ class SemanticMemory:
                 "created_at": now,
             }],
         )
-        return mem_id
+
+        self.conn.execute("""
+            INSERT INTO semantic_memories
+            (memory_id, chroma_id, namespace, scope, content, original_text,
+             tags, confidence, importance, memory_type, status, source,
+             source_message_ids, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            memory_id, chroma_id, self._namespace, self._scope,
+            result.content, original_text[:500] if original_text else "",
+            tags_str, result.confidence, result.importance,
+            result.memory_type, status, source, msg_ids, now, now,
+        ))
+        self.conn.commit()
+        return memory_id
 
     def archive(self, memory_id: str) -> None:
-        record = self.get_memory(memory_id)
-        if not record:
-            return
-        now = datetime.now(timezone.utc).isoformat()
-        self.collection.update(
-            ids=[memory_id],
-            metadatas=[{
-                "user_id": self._user_id,
-                "tags": ",".join(record.tags),
-                "confidence": record.confidence,
-                "memory_type": record.memory_type,
-                "status": "archived",
-                "source": record.source,
-                "created_at": record.created_at,
-                "updated_at": now,
-            }],
+        self.conn.execute(
+            "UPDATE semantic_memories SET status='archived', updated_at=datetime('now') WHERE memory_id=?",
+            (memory_id,),
         )
+        self.conn.commit()
+        row = self.conn.execute(
+            "SELECT chroma_id FROM semantic_memories WHERE memory_id=?", (memory_id,)
+        ).fetchone()
+        if row and row[0]:
+            self.collection.update(
+                ids=[row[0]],
+                metadatas=[{"status": "archived"}],
+            )
 
     def forget(self, memory_id: str) -> None:
-        self.collection.delete(ids=[memory_id])
+        row = self.conn.execute(
+            "SELECT chroma_id FROM semantic_memories WHERE memory_id = ?", (memory_id,)
+        ).fetchone()
+        if not row:
+            return
+        if row[0]:
+            self.collection.delete(ids=[row[0]])
+        self.conn.execute(
+            "UPDATE semantic_memories SET status='deleted', updated_at=datetime('now') WHERE memory_id=?",
+            (memory_id,),
+        )
+        self.conn.commit()
+
+    def purge(self, memory_id: str) -> None:
+        row = self.conn.execute(
+            "SELECT chroma_id FROM semantic_memories WHERE memory_id = ?", (memory_id,)
+        ).fetchone()
+        if row and row[0]:
+            self.collection.delete(ids=[row[0]])
+        self.conn.execute("DELETE FROM semantic_memories WHERE memory_id = ?", (memory_id,))
+        self.conn.commit()
 
     # ── Query ──────────────────────────────────────────────────
 
@@ -317,6 +355,7 @@ class SemanticMemory:
             n_results=n_results,
             where={
                 "$and": [
+                    {"namespace": {"$eq": self._namespace}},
                     {"user_id": {"$eq": self._user_id}},
                     {"status": {"$eq": "active"}},
                 ],
@@ -327,37 +366,26 @@ class SemanticMemory:
     def search_by_tags(self, tags: list[str]) -> list[MemoryRecord]:
         records = self.list_memories(limit=1000)
         wanted = set(tags)
-        return [
-            r for r in records
-            if wanted.intersection(set(r.tags)) and r.status == "active"
-        ]
+        return [r for r in records if wanted.intersection(set(r.tags)) and r.status == "active"]
 
     def list_memories(self, limit: int = 50) -> list[MemoryRecord]:
-        coll = self.collection
-        results = coll.get(
-            limit=limit,
-            where={"user_id": {"$eq": self._user_id}},
-        )
-        return self._to_records({
-            "ids": [results["ids"]] if results["ids"] else [],
-            "documents": [results["documents"]] if results["documents"] else [],
-            "metadatas": [results["metadatas"]] if results["metadatas"] else [],
-            "distances": None,
-        })
+        rows = self.conn.execute(
+            "SELECT * FROM semantic_memories WHERE namespace=? AND status != 'deleted' ORDER BY created_at DESC LIMIT ?",
+            (self._namespace, limit),
+        ).fetchall()
+        return [self._row_to_record(r) for r in rows]
 
     def get_memory(self, memory_id: str) -> Optional[MemoryRecord]:
-        coll = self.collection
-        results = coll.get(ids=[memory_id])
-        if not results["ids"]:
-            return None
-        return self._to_record(
-            results["ids"][0],
-            results["documents"][0] if results["documents"] else "",
-            results["metadatas"][0] if results["metadatas"] else {},
-        )
+        row = self.conn.execute(
+            "SELECT * FROM semantic_memories WHERE memory_id = ?", (memory_id,)
+        ).fetchone()
+        return self._row_to_record(row) if row else None
 
     def count(self) -> int:
-        return self.collection.count()
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM semantic_memories WHERE namespace=? AND status NOT IN ('deleted','archived')",
+            (self._namespace,),
+        ).fetchone()[0]
 
     # ── Internal ───────────────────────────────────────────────
 
@@ -366,29 +394,61 @@ class SemanticMemory:
         ids = raw.get("ids") or [[]]
         docs = raw.get("documents") or [[]]
         metas = raw.get("metadatas") or [[]]
-
         flat_ids = ids[0] if ids and isinstance(ids[0], list) else ids
         flat_docs = docs[0] if docs and isinstance(docs[0], list) else docs
         flat_metas = metas[0] if metas and isinstance(metas[0], list) else metas
-
         records = []
         for i in range(len(flat_ids)):
             mid = flat_ids[i] if i < len(flat_ids) else ""
             doc = flat_docs[i] if i < len(flat_docs) else ""
             meta = flat_metas[i] if i < len(flat_metas) else {}
-            records.append(SemanticMemory._to_record(mid, doc, meta))
+            records.append(SemanticMemory._from_meta(mid, doc, meta))
         return records
 
     @staticmethod
-    def _to_record(mid: str, doc: str, meta: dict) -> MemoryRecord:
+    def _from_meta(mid: str, doc: str, meta: dict) -> MemoryRecord:
         tags_str = meta.get("tags", "") or ""
         return MemoryRecord(
-            id=mid,
+            chroma_id=mid,
             content=doc,
             tags=tags_str.split(",") if tags_str else [],
             confidence=float(meta.get("confidence", 0)),
             memory_type=meta.get("memory_type", ""),
             status=meta.get("status", "active"),
+            namespace=meta.get("namespace", "normal"),
+            scope=meta.get("scope", "user"),
             created_at=meta.get("created_at", ""),
             source=meta.get("source", "auto"),
+            original_text=meta.get("original_text", ""),
+        )
+
+    @staticmethod
+    def _row_to_record(row) -> MemoryRecord:
+        g = lambda k, d="": row[k] if k in row.keys() else d
+        tags_str = g("tags", "")
+        return MemoryRecord(
+            memory_id=g("memory_id"),
+            chroma_id=g("chroma_id"),
+            content=g("content"),
+            tags=tags_str.split(",") if tags_str else [],
+            confidence=float(g("confidence", 0) or 0),
+            importance=float(g("importance", 0.5) or 0.5),
+            memory_type=g("memory_type"),
+            namespace=g("namespace", "normal"),
+            scope=g("scope", "user"),
+            status=g("status", "active"),
+            source=g("source", "auto"),
+            original_text=g("original_text"),
+            source_message_ids=g("source_message_ids"),
+            created_at=g("created_at"),
+            updated_at=g("updated_at"),
+            owner_type=g("owner_type"),
+            character_id=g("character_id"),
+            source_role=g("source_role"),
+            canon_status=g("canon_status", "canon"),
+            fact_key=g("fact_key"),
+            fact_value=g("fact_value"),
+            scene_id=g("scene_id"),
+            world_id=g("world_id"),
+            expires_scope=g("expires_scope", "never"),
         )

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from .memory import MemoryManager
+from .memory_models import AnalysisResult, MemoryRecord, RoleplayAnalysisResult
+from .memory_router import MemoryRouter
 from .models import LongTermMemory, Message
-from .semantic_memory import AnalysisResult, MemoryRecord, SemanticMemory
+from .roleplay_memory import RoleplaySemanticMemory
+from .semantic_memory import SemanticMemory
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "MemoryManager",
@@ -13,5 +16,8 @@ __all__ = [
     "SemanticMemory",
     "AnalysisResult",
     "MemoryRecord",
+    "RoleplaySemanticMemory",
+    "RoleplayAnalysisResult",
+    "MemoryRouter",
     "__version__",
 ]

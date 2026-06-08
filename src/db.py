@@ -36,6 +36,34 @@ CREATE TABLE IF NOT EXISTS configurations (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS semantic_memories (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    memory_id       TEXT NOT NULL UNIQUE,
+    chroma_id       TEXT UNIQUE,
+    namespace       TEXT NOT NULL DEFAULT 'normal',
+    scope           TEXT NOT NULL DEFAULT 'user',
+    content         TEXT NOT NULL,
+    original_text   TEXT NOT NULL DEFAULT '',
+    tags            TEXT NOT NULL DEFAULT '',
+    confidence      REAL NOT NULL DEFAULT 1.0,
+    importance      REAL NOT NULL DEFAULT 0.5,
+    memory_type     TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'active',
+    source          TEXT NOT NULL DEFAULT 'auto',
+    source_message_ids TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    owner_type      TEXT NOT NULL DEFAULT '',
+    character_id    TEXT NOT NULL DEFAULT '',
+    source_role     TEXT NOT NULL DEFAULT '',
+    canon_status    TEXT NOT NULL DEFAULT 'canon',
+    fact_key        TEXT NOT NULL DEFAULT '',
+    fact_value      TEXT NOT NULL DEFAULT '',
+    scene_id        TEXT NOT NULL DEFAULT '',
+    world_id        TEXT NOT NULL DEFAULT '',
+    expires_scope   TEXT NOT NULL DEFAULT 'never'
+);
 """
 
 
@@ -72,6 +100,35 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             tags        TEXT NOT NULL DEFAULT '',
             weight      REAL NOT NULL DEFAULT 1.0,
             created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS semantic_memories (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_id       TEXT NOT NULL UNIQUE,
+            chroma_id       TEXT UNIQUE,
+            namespace       TEXT NOT NULL DEFAULT 'normal',
+            scope           TEXT NOT NULL DEFAULT 'user',
+            content         TEXT NOT NULL,
+            original_text   TEXT NOT NULL DEFAULT '',
+            tags            TEXT NOT NULL DEFAULT '',
+            confidence      REAL NOT NULL DEFAULT 1.0,
+            importance      REAL NOT NULL DEFAULT 0.5,
+            memory_type     TEXT NOT NULL DEFAULT '',
+            status          TEXT NOT NULL DEFAULT 'active',
+            source          TEXT NOT NULL DEFAULT 'auto',
+            source_message_ids TEXT NOT NULL DEFAULT '',
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            owner_type      TEXT NOT NULL DEFAULT '',
+            character_id    TEXT NOT NULL DEFAULT '',
+            source_role     TEXT NOT NULL DEFAULT '',
+            canon_status    TEXT NOT NULL DEFAULT 'canon',
+            fact_key        TEXT NOT NULL DEFAULT '',
+            fact_value      TEXT NOT NULL DEFAULT '',
+            scene_id        TEXT NOT NULL DEFAULT '',
+            world_id        TEXT NOT NULL DEFAULT '',
+            expires_scope   TEXT NOT NULL DEFAULT 'never'
         )
     """)
     conn.commit()
