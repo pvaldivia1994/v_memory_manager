@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "v_memory_manager"
+version = "0.1.0"
+description = "Persistent memory manager for LLM conversations via SQLite"
+requires-python = ">=3.11"
+license = "MIT"
+keywords = ["memory", "sqlite", "llm", "chat", "persistence"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[tool.setuptools]
+packages = ["v_memory_manager"]
+package-dir = {"v_memory_manager" = "src"}
+
+[tool.setuptools.package-data]
+v_memory_manager = ["*.md"]
