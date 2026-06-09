@@ -66,6 +66,8 @@ class MemoryManager:
     def clear_memory_db(self) -> None:
         self._require_conn()
         db.clear_messages(self._conn)
+        self._conn.execute("DELETE FROM semantic_memories")
+        self._conn.commit()
 
     # ── Messages ───────────────────────────────────────────────
 
@@ -85,7 +87,9 @@ class MemoryManager:
         self._require_conn()
         return db.get_prompt(self._conn, db._ACTIVE) or ""
 
-    def build_system_prompt(self, extra_context: str = "") -> str:
+    def build_system_prompt(self, extra_context: str = "",
+                            semantic_memory: Any = None,
+                            user_query: str = "") -> str:
         self._require_conn()
 
         parts = []
@@ -94,8 +98,19 @@ class MemoryManager:
         if core:
             parts.append(core)
 
+        # ── Inyección dinámica de memorias semánticas (Fase 4) ──
+        if semantic_memory and user_query:
+            try:
+                results = semantic_memory.search(user_query, n_results=5)
+                if results:
+                    lines = "\n".join(f"- {m.content}" for m in results)
+                    parts.append(f"[USER_MEMORY]\n{lines}")
+            except Exception:
+                pass  # fallback a extra_context si falla
+
         if extra_context:
-            parts.append("[USER_MEMORY]")
+            if "[USER_MEMORY]" not in "\n".join(parts):
+                parts.append("[USER_MEMORY]")
             parts.append(extra_context)
 
         all_prompts = db.get_all_prompts_ordered(self._conn)
@@ -103,6 +118,7 @@ class MemoryManager:
         for _, content, _ in extra:
             parts.append(content)
 
+        # Legacy: long_term_memories (deprecated, migrar a semantic_memories)
         memories = db.get_all_long_term_memories(self._conn)
         if memories:
             block = "\n".join(f"- {m.content}" for m in memories)

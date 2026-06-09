@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import sys
 from pathlib import Path
 
@@ -15,6 +16,7 @@ logging.basicConfig(
 log = logging.getLogger("chat")
 
 _ROOT = Path(__file__).resolve().parent.parent
+_CHROMA_DIR = _ROOT / ".chatdb" / "chroma"
 _VLLAMA = _ROOT.parent / "v_llama"
 
 # ── importar v_llama ─────────────────────────────────────
@@ -39,7 +41,7 @@ GREEN = "\033[32m"
 RESET = "\033[0m"
 
 
-def _show_stats(r, msg_ids: list[int] | None = None) -> None:
+def _show_stats(r, msg_ids: list[int] | None = None, mem_count: int | None = None) -> None:
     total = r.prompt_tokens + r.completion_tokens
     remaining = r.context_remaining
     pct = round((total / r.context_limit) * 100, 1) if r.context_limit else 0
@@ -47,7 +49,14 @@ def _show_stats(r, msg_ids: list[int] | None = None) -> None:
     print()
     print(
         f"{DIM}"
-        f"[{r.duration_ms}ms | {r.tokens_per_second} tok/s]\n"
+        f"[{r.duration_ms}ms | {r.tokens_per_second} tok/s]",
+        end=""
+    )
+    if mem_count is not None:
+        print(f"  memorias {mem_count}", end="")
+    print()
+    print(
+        f"{DIM}"
         f"  prompt  {r.prompt_tokens:>6}  (system {r.system_tokens}, "
         f"history {r.history_tokens}, user {r.prompt_tokens - r.system_tokens - r.history_tokens})\n"
     )
@@ -95,11 +104,20 @@ def _pick_model(llm) -> str:
         print(f"  Opción inválida. Elija entre 1 y {len(models)}.")
 
 
-def _ask_continue(db_path: Path, mem: MemoryManager) -> None:
+def _clear_chroma(chroma_dir: Path) -> None:
+    if chroma_dir.exists():
+        shutil.rmtree(chroma_dir)
+        print(f"[ChromaDB limpiada]")
+        chroma_dir.mkdir(parents=True, exist_ok=True)
+
+
+def _ask_continue(db_path: Path, mem: MemoryManager, chroma_dir: Path | None = None) -> None:
     if not db_path.exists():
         db_path.parent.mkdir(parents=True, exist_ok=True)
         mem.create_memory_db(str(db_path))
         print(f"[Memoria creada: {db_path.name}]")
+        if chroma_dir:
+            _clear_chroma(chroma_dir)
         return
 
     mem.load_memory_db(str(db_path))
@@ -115,6 +133,8 @@ def _ask_continue(db_path: Path, mem: MemoryManager) -> None:
         print(f"{DIM}──────────────────────{RESET}")
     else:
         mem.clear_memory_db()
+        if chroma_dir:
+            _clear_chroma(chroma_dir)
         print("[DB reiniciada]")
 
 
@@ -158,13 +178,14 @@ def main():
 
     # ── Memoria ────────────────────────────────────────────────
     mem = MemoryManager()
-    _ask_continue(Path(args.db), mem)
+    _ask_continue(Path(args.db), mem, _CHROMA_DIR)
     mem.set_config("model_name", llm.model_name)
 
     try:
         sem = SemanticMemory(
-            persist_dir=str(_ROOT / ".chatdb" / "chroma"),
+            persist_dir=str(_CHROMA_DIR),
             sqlite_conn=mem._conn,
+            allow_assistant_memory=True,
         )
     except Exception as e:
         print(f"{DIM}[SemanticMemory no disponible: {e}]{RESET}")
@@ -172,7 +193,7 @@ def main():
 
     system_prompt = _ask_system_prompt(mem)
 
-    print(f"\nComandos: /clear  /prompt <texto>  /save <nombre>  /load <nombre>  /show_prompt  /remember <texto>  /memories  /search <q>  /forget <id>  /exit\n")
+    print(f"\nComandos: /clear  /prompt <texto>  /save <nombre>  /load <nombre>  /show_prompt  /remember <texto>  /memories  /search <q>  /forget <id>  /review  /exit\n")
 
     stream = not args.no_stream
 
@@ -195,8 +216,10 @@ def main():
 
             elif cmd == "/clear":
                 mem.clear_memory_db()
+                if sem:
+                    _clear_chroma(_CHROMA_DIR)
                 system_prompt = mem.get_system_prompt()
-                print("[Historial limpiado, system prompt conservado]")
+                print("[Historial limpiado, ChromaDB y system prompt conservados]")
                 continue
 
             elif cmd == "/prompt":
@@ -293,6 +316,48 @@ def main():
                 print(f"{DIM}──────────────────────────{RESET}")
                 continue
 
+            elif cmd == "/review":
+                if not sem:
+                    print("[SemanticMemory no disponible]")
+                    continue
+                pending = sem.review_pending(limit=10)
+                if not pending:
+                    print("[No hay memorias pendientes de revisión]")
+                    continue
+                print(f"\n{DIM}── Memorias pendientes ({len(pending)}) ──{RESET}")
+                for i, m in enumerate(pending, 1):
+                    tag_str = f" [{', '.join(m.tags)}]" if m.tags else ""
+                    print(f"  {i}. {m.memory_id[:16]}: {m.content[:80]}{tag_str} (conf={m.confidence:.2f})")
+                print(f"{DIM}──────────────────────────{RESET}")
+                action = input(f"{CYAN}Acción (a=aprobar, r=rechazar, #=número, enter=saltar):{RESET} ").strip().lower()
+                if not action:
+                    continue
+                for token in action.split():
+                    parts_review = token.split(":", 1) if ":" in token else [token, ""]
+                    try:
+                        idx = int(parts_review[0]) - 1
+                        if 0 <= idx < len(pending):
+                            mid = pending[idx].memory_id
+                            act = parts_review[1] if len(parts_review) > 1 else "a"
+                            if act in ("r", "reject"):
+                                sem.reject(mid)
+                                print(f"  [Rechazada: {mid[:16]}]")
+                            else:
+                                sem.approve(mid)
+                                print(f"  [Aprobada: {mid[:16]}]")
+                    except (ValueError, IndexError):
+                        if token == "a":
+                            for m in pending:
+                                sem.approve(m.memory_id)
+                            print(f"  [Todas aprobadas ({len(pending)})]")
+                            break
+                        elif token == "r":
+                            for m in pending:
+                                sem.reject(m.memory_id)
+                            print(f"  [Todas rechazadas ({len(pending)})]")
+                            break
+                continue
+
             else:
                 print(f"[Comando desconocido: {cmd}]")
                 continue
@@ -300,12 +365,14 @@ def main():
         # ── Chat ────────────────────────────────────────────
 
         extra_context = ""
+        mem_count = 0
         if sem:
             results = sem.search(user, n_results=3)
             if results:
+                mem_count = len(results)
                 lines = "\n".join(f"- {m.content}" for m in results)
                 extra_context = lines
-                print(f"{DIM}[{len(results)} memorias recuperadas]{RESET}")
+                print(f"{DIM}[{mem_count} memorias recuperadas]{RESET}")
 
         full_system = mem.build_system_prompt(extra_context=extra_context)
         if extra_context:
@@ -340,7 +407,7 @@ def main():
                 if not full:
                     log.warning("Stream empty response | user=%r | system_len=%d | prompt_tokens=%d | finish=%s",
                                 user[:100], len(full_system), stats.prompt_tokens, stats.finish_reason)
-                _show_stats(stats, msg_ids)
+                _show_stats(stats, msg_ids, mem_count)
             if full:
                 mem.add_message("user", user)
                 mem.add_message("assistant", full)
@@ -348,7 +415,7 @@ def main():
                     mid = sem.remember(user)
                     if mid:
                         print(f"{DIM}[Memoria guardada: {mid}]{RESET}")
-                    mid2 = sem.remember(full)
+                    mid2 = sem.remember(full, source_role="assistant")
                     if mid2:
                         print(f"{DIM}[Memoria del asistente: {mid2}]{RESET}")
         else:
@@ -362,7 +429,7 @@ def main():
                     log.warning("Empty response | user=%r | system_len=%d | prompt=%d | finish=%s",
                                 user[:100], len(full_system), res.prompt_tokens, res.finish_reason)
                 print(res.content)
-                _show_stats(res, msg_ids)
+                _show_stats(res, msg_ids, mem_count)
                 if res.content:
                     mem.add_message("user", user)
                     mem.add_message("assistant", res.content)
@@ -370,7 +437,7 @@ def main():
                         mid = sem.remember(user)
                         if mid:
                             print(f"{DIM}[Memoria guardada: {mid}]{RESET}")
-                        mid2 = sem.remember(res.content)
+                        mid2 = sem.remember(res.content, source_role="assistant")
                         if mid2:
                             print(f"{DIM}[Memoria del asistente: {mid2}]{RESET}")
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "v_memory_manager"
-version = "0.1.0"
+version = "0.5.0"
 description = "Persistent memory manager for LLM conversations via SQLite"
 requires-python = ">=3.11"
 license = "MIT"
@@ -24,3 +24,6 @@ package-dir = {"v_memory_manager" = "src"}
 
 [tool.setuptools.package-data]
 v_memory_manager = ["*.md"]
+
+[project.optional-dependencies]
+nlp = ["spacy>=3.7"]

@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS semantic_memories (
     owner_type      TEXT NOT NULL DEFAULT '',
     character_id    TEXT NOT NULL DEFAULT '',
     source_role     TEXT NOT NULL DEFAULT '',
+    user_id         TEXT NOT NULL DEFAULT 'default',
     canon_status    TEXT NOT NULL DEFAULT 'canon',
     fact_key        TEXT NOT NULL DEFAULT '',
     fact_value      TEXT NOT NULL DEFAULT '',
@@ -123,6 +124,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             owner_type      TEXT NOT NULL DEFAULT '',
             character_id    TEXT NOT NULL DEFAULT '',
             source_role     TEXT NOT NULL DEFAULT '',
+            user_id         TEXT NOT NULL DEFAULT 'default',
             canon_status    TEXT NOT NULL DEFAULT 'canon',
             fact_key        TEXT NOT NULL DEFAULT '',
             fact_value      TEXT NOT NULL DEFAULT '',
@@ -131,6 +133,12 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             expires_scope   TEXT NOT NULL DEFAULT 'never'
         )
     """)
+
+    # Migration: add user_id if missing (pre-v0.4.1 databases)
+    sem_cols = {r[1] for r in conn.execute("PRAGMA table_info(semantic_memories)").fetchall()}
+    if "user_id" not in sem_cols:
+        conn.execute("ALTER TABLE semantic_memories ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'")
+
     conn.commit()
 
 

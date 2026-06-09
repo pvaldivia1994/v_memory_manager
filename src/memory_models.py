@@ -12,6 +12,9 @@ class AnalysisResult:
     memory_type: str = ""
     tags: list[str] = field(default_factory=list)
     importance: float = 0.5
+    fact_key: str = ""
+    fact_value: str = ""
+
 
 
 @dataclass

@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+# pyrefly: ignore [missing-import]
 from .memory import MemoryManager
+# pyrefly: ignore [missing-import]
 from .memory_models import AnalysisResult, MemoryRecord
+# pyrefly: ignore [missing-import]
 from .models import LongTermMemory, Message
-from .semantic_memory import SemanticMemory
+# pyrefly: ignore [missing-import]
+from .semantic_memory import (
+    SemanticMemory,
+    analyze_assistant_text,
+    migrate_long_term_to_semantic,
+)
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "MemoryManager",
@@ -14,5 +22,7 @@ __all__ = [
     "SemanticMemory",
     "AnalysisResult",
     "MemoryRecord",
+    "analyze_assistant_text",
+    "migrate_long_term_to_semantic",
     "__version__",
 ]
