@@ -397,22 +397,22 @@ def detect_assistant_self_memory(text: str, nlp_result: Optional[SpacyResult] = 
             tags=tags,
         )
 
-    # Fallback por lemma (spaCy)
+    # Fallback por lemma (spaCy) — solo matchea root_lemma, no todos los lemas
     if nlp_result and nlp_result.is_first_person and nlp_result.root_verb:
         root_lemma = nlp_result.root_lemma
         memory_type = None
         template = None
         tags = ["assistant"]
 
-        if lemmatized_match(nlp_result, _LEMMA_MEMORY_HINTS.get("negative_preference", [])):
+        if root_lemma in _LEMMA_MEMORY_HINTS.get("negative_preference", []):
             memory_type = "assistant_negative_preference"
             template = "Al asistente no le gusta {}."
             tags.append("dislikes")
-        elif lemmatized_match(nlp_result, _LEMMA_MEMORY_HINTS.get("positive_preference", [])):
+        elif root_lemma in _LEMMA_MEMORY_HINTS.get("positive_preference", []):
             memory_type = "assistant_preference"
             template = "Al asistente le gusta {}."
             tags.append("likes")
-        elif lemmatized_match(nlp_result, _LEMMA_MEMORY_HINTS.get("personal_identity", [])):
+        elif root_lemma in _LEMMA_MEMORY_HINTS.get("personal_identity", []):
             memory_type = "assistant_identity"
             template = "El asistente dice que {}."
             tags.append("identity")
