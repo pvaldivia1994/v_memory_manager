@@ -561,7 +561,15 @@ def analyze_text(text: str) -> AnalysisResult:
         )
 
     if is_question_like(text, nlp_result):
-        return AnalysisResult(should_remember=False, reason="question_like")
+        candidate = _strip_question_tail(text)
+        if candidate and candidate != text.strip():
+            candidate_score = memory_score(candidate)
+            candidate_mtype = detect_type(candidate)
+            candidate_explicit = extract_explicit(candidate)
+            if not (candidate_explicit or candidate_score >= 0.40 or candidate_mtype):
+                return AnalysisResult(should_remember=False, reason="question_like")
+        else:
+            return AnalysisResult(should_remember=False, reason="question_like")
 
     negative = detect_negative_memory(text, nlp_result)
     if negative:
