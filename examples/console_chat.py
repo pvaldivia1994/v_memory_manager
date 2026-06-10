@@ -33,7 +33,7 @@ sys.path.insert(0, str(_ROOT))
 for k in list(sys.modules):
     if k.startswith("src"):
         del sys.modules[k]
-from src import ConversationSummaryMemory, MemoryManager, SemanticMemory
+from src import BookMemory, ConversationSummaryMemory, MemoryManager, SemanticMemory, should_search_books
 
 DIM = "\033[90m"
 CYAN = "\033[36m"
@@ -41,7 +41,9 @@ GREEN = "\033[32m"
 RESET = "\033[0m"
 
 
-def _show_stats(r, msg_ids: list[int] | None = None, mem_count: int | None = None) -> None:
+def _show_stats(r, msg_ids: list[int] | None = None,
+                mem_count: int | None = None,
+                book_chars: int = 0) -> None:
     total = r.prompt_tokens + r.completion_tokens
     remaining = r.context_remaining
     pct = round((total / r.context_limit) * 100, 1) if r.context_limit else 0
@@ -54,6 +56,8 @@ def _show_stats(r, msg_ids: list[int] | None = None, mem_count: int | None = Non
     )
     if mem_count is not None:
         print(f"  memorias {mem_count}", end="")
+    if book_chars:
+        print(f"  libro {book_chars}c", end="")
     print()
     print(
         f"{DIM}"
@@ -104,11 +108,22 @@ def _pick_model(llm) -> str:
         print(f"  Opción inválida. Elija entre 1 y {len(models)}.")
 
 
-def _clear_chroma(chroma_dir: Path) -> None:
-    if chroma_dir.exists():
+def _clear_chroma(chroma_dir: Path, book_mem: Any = None) -> None:
+    if not chroma_dir.exists():
+        return
+    try:
+        import chromadb
+        client = chromadb.PersistentClient(path=str(chroma_dir))
+        for coll_name in ["semantic_memories"]:
+            try:
+                client.delete_collection(coll_name)
+            except Exception:
+                pass
+        print(f"[ChromaDB: colecciones semanticas limpiadas]")
+    except Exception:
         shutil.rmtree(chroma_dir)
-        print(f"[ChromaDB limpiada]")
         chroma_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[ChromaDB limpiada]")
 
 
 def _ask_continue(db_path: Path, mem: MemoryManager, chroma_dir: Path | None = None) -> None:
@@ -162,6 +177,11 @@ def main():
     parser.add_argument("--config", help="Ruta al config.json de v_llama")
     parser.add_argument("--model", help="Nombre o ruta del modelo GGUF")
     parser.add_argument("--no-stream", action="store_true", help="Deshabilitar streaming")
+    parser.add_argument("--book", help="Ruta a PDF/EPUB/TXT para ingestar al iniciar")
+    parser.add_argument("--extract", help="Solo extraer texto a TXT (no indexar)")
+    parser.add_argument("--pdf-layout", default="auto",
+                        choices=["plain", "blocks", "two_columns", "auto"],
+                        help="Layout de PDF: plain, blocks, two_columns, auto")
     args = parser.parse_args()
 
     # ── v_llama ────────────────────────────────────────────────
@@ -191,6 +211,48 @@ def main():
         print(f"{DIM}[SemanticMemory no disponible: {e}]{RESET}")
         sem = None
 
+    if args.extract:
+        try:
+            bm_temp = BookMemory(persist_dir=str(_CHROMA_DIR))
+            out = bm_temp.extract_to_txt(
+                args.extract,
+                str(_ROOT / ".chatdb" / "extracted" / Path(args.extract).with_suffix(".txt").name),
+                pdf_layout=args.pdf_layout,
+            )
+            print(f"[Extraccion completada. Revisa el archivo antes de indexar con --book]")
+        except Exception as e:
+            print(f"[Error al extraer: {e}]")
+        return
+
+    try:
+        book_mem = BookMemory(
+            persist_dir=str(_CHROMA_DIR),
+            sqlite_conn=mem._conn,
+        )
+        if args.book:
+            book_path = Path(args.book)
+            if not book_path.exists():
+                print(f"{DIM}[Libro no encontrado: {args.book}]{RESET}")
+            else:
+                try:
+                    extracted_dir = _ROOT / ".chatdb" / "extracted"
+                    extracted_dir.mkdir(parents=True, exist_ok=True)
+                    save_path = str(extracted_dir / book_path.with_suffix(".txt").name)
+                    bid = book_mem.ingest(
+                        str(book_path),
+                        pdf_layout=args.pdf_layout,
+                        save_extracted_to=save_path,
+                    )
+                    b = book_mem.get_book(bid)
+                    print(f"[Libro cargado: {b['title']} ({bid}) - {b['total_chunks']} chunks]")
+                    print(f"[Texto extraido en: {save_path}]")
+                except Exception as e:
+                    print(f"{DIM}[Error al cargar libro: {e}]{RESET}")
+        print(f"{DIM}[BookMemory: {book_mem.has_books()} libros]{RESET}")
+    except Exception as e:
+        print(f"{DIM}[BookMemory no disponible: {e}]{RESET}")
+        book_mem = None
+
     summarizer_model = None
     try:
         summarizer_model = VLLaMA(model="Gemma-3-1B.gguf", auto_load=True)
@@ -207,7 +269,7 @@ def main():
 
     system_prompt = _ask_system_prompt(mem)
 
-    print(f"\nComandos: /clear  /prompt <texto>  /save <nombre>  /load <nombre>  /show_prompt  /remember <texto>  /memories  /search <q>  /forget <id>  /review  /exit\n")
+    print(f"\nComandos: /clear  /prompt  /save  /load  /show_prompt  /remember  /memories  /search  /forget  /review  /book  /exit\n")
 
     stream = not args.no_stream
 
@@ -372,6 +434,78 @@ def main():
                             break
                 continue
 
+            elif cmd == "/book":
+                if not book_mem:
+                    print("[BookMemory no disponible]")
+                    continue
+                if len(parts) < 2:
+                    print("[Uso: /book <consulta>]")
+                    print("  /book list             - Listar libros indexados")
+                    print("  /book ingest <ruta>    - Ingestar un PDF/TXT")
+                    print("  /book search <consulta> - Buscar en libros")
+                    print("  /book stats            - Estadisticas")
+                    continue
+                sub = parts[1].split(maxsplit=1)
+                sub_cmd = sub[0].lower()
+                sub_arg = sub[1] if len(sub) > 1 else ""
+
+                if sub_cmd == "list":
+                    books = book_mem.list_books()
+                    if not books:
+                        print("[No hay libros indexados]")
+                        continue
+                    print(f"\n{DIM}── Libros ({len(books)}) ──{RESET}")
+                    for b in books:
+                        print(f"  {b['id']}: {b['title']} ({b['status']}, {b['total_chunks']} chunks)")
+                    print(f"{DIM}─────────────────────{RESET}")
+
+                elif sub_cmd == "ingest":
+                    if not sub_arg:
+                        print("[Uso: /book ingest <ruta_al_pdf/txt>]")
+                        continue
+                    try:
+                        bid = book_mem.ingest(sub_arg)
+                        book = book_mem.get_book(bid)
+                        print(f"[Libro indexado: {book['title']} ({bid}) - {book['total_chunks']} chunks]")
+                    except Exception as e:
+                        print(f"[Error al ingestar: {e}]")
+
+                elif sub_cmd in ("search", "s"):
+                    if not sub_arg:
+                        print("[Uso: /book search <consulta>]")
+                        continue
+                    ctx = book_mem.build_context(sub_arg, n_results=5, max_chars=5000)
+                    if not ctx:
+                        print("[Sin resultados en libros]")
+                        continue
+                    print(f"\n{DIM}── Resultados en libros ──{RESET}")
+                    print(ctx)
+                    print(f"{DIM}─────────────────────────{RESET}")
+
+                elif sub_cmd == "delete":
+                    if not sub_arg:
+                        print("[Uso: /book delete <book_id>]")
+                        print("  /book list  - para ver los IDs")
+                        continue
+                    book = book_mem.get_book(sub_arg)
+                    if not book:
+                        print(f"[Libro no encontrado: {sub_arg}]")
+                        continue
+                    resp = input(f"Borrar '{book['title']}' ({book['total_chunks']} chunks)? (s/N): ").strip().lower()
+                    if resp == "s":
+                        book_mem.delete_book(sub_arg)
+                        print(f"[Libro eliminado: {sub_arg}]")
+                    else:
+                        print("[Cancelado]")
+
+                elif sub_cmd == "stats":
+                    stats = book_mem.get_stats()
+                    print(f"[Libros: {stats['total_books']}, Chunks: {stats['total_chunks']}]")
+
+                else:
+                    print(f"[Subcomando desconocido: {sub_cmd}]")
+                continue
+
             else:
                 print(f"[Comando desconocido: {cmd}]")
                 continue
@@ -382,6 +516,7 @@ def main():
 
         extra_context = ""
         mem_count = 0
+        book_chars = 0
         if sem:
             results = sem.search(user, n_results=3)
             if results:
@@ -390,9 +525,17 @@ def main():
                 extra_context = lines
                 print(f"{DIM}[{mem_count} memorias recuperadas]{RESET}")
 
+        book_context = ""
+        if book_mem and book_mem.has_books():
+            book_context = book_mem.build_context(user, n_results=3, max_chars=3000)
+            if book_context:
+                book_chars = len(book_context)
+                print(f"{DIM}[{book_chars}c de contexto de libros recuperados]{RESET}")
+
         full_system = mem.build_system_prompt(
             extra_context=extra_context,
             conv_summary_memory=conv_summary,
+            book_context=book_context,
         )
         if extra_context:
             log.warning("System prompt con memorias (%d chars):\n%s", len(full_system), full_system)
@@ -426,7 +569,7 @@ def main():
                 if not full:
                     log.warning("Stream empty response | user=%r | system_len=%d | prompt_tokens=%d | finish=%s",
                                 user[:100], len(full_system), stats.prompt_tokens, stats.finish_reason)
-                _show_stats(stats, msg_ids, mem_count)
+                _show_stats(stats, msg_ids, mem_count, book_chars)
             if full:
                 mem.add_message("user", user)
                 mem.add_message("assistant", full)
@@ -448,7 +591,7 @@ def main():
                     log.warning("Empty response | user=%r | system_len=%d | prompt=%d | finish=%s",
                                 user[:100], len(full_system), res.prompt_tokens, res.finish_reason)
                 print(res.content)
-                _show_stats(res, msg_ids, mem_count)
+                _show_stats(res, msg_ids, mem_count, book_chars)
                 if res.content:
                     mem.add_message("user", user)
                     mem.add_message("assistant", res.content)

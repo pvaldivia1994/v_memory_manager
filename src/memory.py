@@ -69,9 +69,23 @@ class MemoryManager:
             self._db_path = ""
 
     def clear_memory_db(self) -> None:
+        """Limpia mensajes y memorias semanticas. No borra BookMemory."""
         self._require_conn()
         db.clear_messages(self._conn)
         self._conn.execute("DELETE FROM semantic_memories")
+        self._conn.commit()
+
+    def clear_all_memory(self) -> None:
+        """Limpia TODO: mensajes, semantic_memories, books, book_chunks."""
+        self._require_conn()
+        db.clear_messages(self._conn)
+        self._conn.execute("DELETE FROM semantic_memories")
+        self._conn.execute("DELETE FROM book_chunks")
+        self._conn.execute("DELETE FROM books")
+        try:
+            self._conn.execute("DELETE FROM book_chunks_fts")
+        except Exception:
+            pass
         self._conn.commit()
 
     # ── Messages ───────────────────────────────────────────────
@@ -83,9 +97,16 @@ class MemoryManager:
         else:
             db.add_message(self._conn, role, content)
 
-    def get_history(self, max_messages: int = 10, extra_context: str = "") -> list[Message]:
+    def get_history(self, max_messages: int = 10, extra_context: str = "",
+                    semantic_memory: Any = None, user_query: str = "",
+                    conv_summary_memory: Any = None,
+                    book_context: str = "") -> list[Message]:
         self._require_conn()
-        system_prompt = self.build_system_prompt(extra_context=extra_context)
+        system_prompt = self.build_system_prompt(
+            extra_context=extra_context, semantic_memory=semantic_memory,
+            user_query=user_query, conv_summary_memory=conv_summary_memory,
+            book_context=book_context,
+        )
         return deque.build_history(self._conn, max_messages, system_prompt)
 
     def get_system_prompt(self) -> str:
@@ -95,7 +116,8 @@ class MemoryManager:
     def build_system_prompt(self, extra_context: str = "",
                             semantic_memory: Any = None,
                             user_query: str = "",
-                            conv_summary_memory: Any = None) -> str:
+                            conv_summary_memory: Any = None,
+                            book_context: str = "") -> str:
         self._require_conn()
 
         parts = []
@@ -144,6 +166,10 @@ class MemoryManager:
             block = conv_summary_memory.build_context_block()
             if block:
                 parts.append(block)
+
+        # ── Contexto de libros (BookMemory) ──
+        if book_context:
+            parts.append(book_context)
 
         if extra_context:
             if "[USER_MEMORY]" not in "\n".join(parts):

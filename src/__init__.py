@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 # pyrefly: ignore [missing-import]
+from .book_memory import BookMemory, should_search_books
+# pyrefly: ignore [missing-import]
+from .book_models import BookChunk, BookInfo
+# pyrefly: ignore [missing-import]
 from .conversation_summary import ConversationSummaryMemory
 # pyrefly: ignore [missing-import]
 from .memory import MemoryManager
@@ -18,6 +22,9 @@ from .semantic_memory import (
 __version__ = "0.5.0"
 
 __all__ = [
+    "BookChunk",
+    "BookInfo",
+    "BookMemory",
     "ConversationSummaryMemory",
     "MemoryManager",
     "Message",
@@ -27,5 +34,6 @@ __all__ = [
     "MemoryRecord",
     "analyze_assistant_text",
     "migrate_long_term_to_semantic",
+    "should_search_books",
     "__version__",
 ]
