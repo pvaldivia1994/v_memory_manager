@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import db, deque
+from .conversation_summary import ConversationSummaryMemory
 from .models import LongTermMemory, Message
 
 
@@ -13,6 +14,10 @@ class MemoryManager:
     def __init__(self):
         self._conn: Optional[sqlite3.Connection] = None
         self._db_path: str = ""
+
+    @property
+    def conn(self) -> Optional[sqlite3.Connection]:
+        return self._conn
 
     # ── Lifecycle ──────────────────────────────────────────────
 
@@ -89,7 +94,8 @@ class MemoryManager:
 
     def build_system_prompt(self, extra_context: str = "",
                             semantic_memory: Any = None,
-                            user_query: str = "") -> str:
+                            user_query: str = "",
+                            conv_summary_memory: Any = None) -> str:
         self._require_conn()
 
         parts = []
@@ -97,6 +103,25 @@ class MemoryManager:
         core = db.get_prompt(self._conn, db._ACTIVE)
         if core:
             parts.append(core)
+
+        # ── Reglas de uso de memoria (antes de las memorias) ──
+        rules_lines = [
+            "[USO DE MEMORIA]",
+            "- USER_MEMORY describe al usuario que está conversando.",
+            "- ASSISTANT_MEMORY describe al asistente.",
+            "- PROJECT_MEMORY describe proyectos o contexto técnico.",
+            "- CONVERSATION_SUMMARY resume partes anteriores de esta conversación que ya no están en el sliding window.",
+            "- El sliding window tiene más detalle reciente que CONVERSATION_SUMMARY.",
+            "- Si CONVERSATION_SUMMARY contradice los últimos mensajes, usar los últimos mensajes.",
+            "- Si USER_MEMORY contradice CONVERSATION_SUMMARY, usar USER_MEMORY.",
+            "- extra_context tiene prioridad sobre CONVERSATION_SUMMARY si contradicen.",
+            "- No tratar CONVERSATION_SUMMARY como una cita exacta; es una compresión.",
+            "- Si el usuario pregunta por 'mi', 'me', 'yo', 'mis gustos', 'mi nombre' o 'mi favorito', revisa USER_MEMORY primero.",
+            "- Si USER_MEMORY contiene la respuesta, responde directamente usando esa memoria.",
+            "- No digas 'como modelo de lenguaje no tengo preferencias' cuando el usuario pregunta por sus propias preferencias.",
+            "- No respondas con explicaciones genéricas si hay una memoria relevante en USER_MEMORY.",
+        ]
+        parts.append("\n".join(rules_lines))
 
         # ── Inyección dinámica de memorias semánticas (Fase 4) ──
         if semantic_memory and user_query:
@@ -108,6 +133,18 @@ class MemoryManager:
             except Exception:
                 pass  # fallback a extra_context si falla
 
+        # Legacy: long_term_memories (deprecated, migrar a semantic_memories)
+        memories = db.get_all_long_term_memories(self._conn)
+        if memories:
+            block = "\n".join(f"- {m.content}" for m in memories)
+            parts.append(f"[ASSISTANT_MEMORY]\n{block}")
+
+        # ── Resumen de continuidad conversacional ──
+        if conv_summary_memory:
+            block = conv_summary_memory.build_context_block()
+            if block:
+                parts.append(block)
+
         if extra_context:
             if "[USER_MEMORY]" not in "\n".join(parts):
                 parts.append("[USER_MEMORY]")
@@ -117,24 +154,6 @@ class MemoryManager:
         extra = [(n, c, o) for n, c, o in all_prompts if n != db._ACTIVE]
         for _, content, _ in extra:
             parts.append(content)
-
-        # Legacy: long_term_memories (deprecated, migrar a semantic_memories)
-        memories = db.get_all_long_term_memories(self._conn)
-        if memories:
-            block = "\n".join(f"- {m.content}" for m in memories)
-            parts.append(f"[ASSISTANT_MEMORY]\n{block}")
-
-        rules = (
-            "[USO DE MEMORIA]\n"
-            "- USER_MEMORY describe al usuario que está conversando.\n"
-            "- ASSISTANT_MEMORY describe al asistente.\n"
-            "- PROJECT_MEMORY describe proyectos o contexto técnico.\n"
-            "- Si el usuario pregunta por 'mi', 'me', 'yo', 'mis gustos', 'mi nombre' o 'mi favorito', revisa USER_MEMORY primero.\n"
-            "- Si USER_MEMORY contiene la respuesta, responde directamente usando esa memoria.\n"
-            "- No digas 'como modelo de lenguaje no tengo preferencias' cuando el usuario pregunta por sus propias preferencias.\n"
-            "- No respondas con explicaciones genéricas si hay una memoria relevante en USER_MEMORY."
-        )
-        parts.append(rules)
 
         return "\n\n".join(parts)
 

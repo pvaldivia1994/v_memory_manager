@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 # pyrefly: ignore [missing-import]
+from .conversation_summary import ConversationSummaryMemory
+# pyrefly: ignore [missing-import]
 from .memory import MemoryManager
 # pyrefly: ignore [missing-import]
 from .memory_models import AnalysisResult, MemoryRecord
@@ -16,6 +18,7 @@ from .semantic_memory import (
 __version__ = "0.5.0"
 
 __all__ = [
+    "ConversationSummaryMemory",
     "MemoryManager",
     "Message",
     "LongTermMemory",

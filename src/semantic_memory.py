@@ -376,6 +376,18 @@ def detect_assistant_self_memory(text: str, nlp_result: Optional[SpacyResult] = 
             "Al asistente le encanta {}.",
             ["assistant", "likes"],
         ),
+        (
+            r"\bme encantaria\s+([^.!?\n]+)",
+            "assistant_preference",
+            "Al asistente le encantaria {}.",
+            ["assistant", "likes", "desires"],
+        ),
+        (
+            r"\bme gustaria\s+([^.!?\n]+)",
+            "assistant_preference",
+            "Al asistente le gustaria {}.",
+            ["assistant", "likes", "desires"],
+        ),
     ]
 
     for pattern, memory_type, template, tags in patterns:
@@ -456,7 +468,7 @@ def detect_assistant_self_memory(text: str, nlp_result: Optional[SpacyResult] = 
 
 
 def _strip_question_tail(text: str) -> str:
-    return re.split(r"[?\u00bf]", text, maxsplit=1)[0].strip()
+    return re.split(r"\?", text, maxsplit=1)[0].strip()
 
 
 def analyze_assistant_text(text: str) -> AnalysisResult:

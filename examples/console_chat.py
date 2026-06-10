@@ -33,7 +33,7 @@ sys.path.insert(0, str(_ROOT))
 for k in list(sys.modules):
     if k.startswith("src"):
         del sys.modules[k]
-from src import MemoryManager, SemanticMemory
+from src import ConversationSummaryMemory, MemoryManager, SemanticMemory
 
 DIM = "\033[90m"
 CYAN = "\033[36m"
@@ -190,6 +190,20 @@ def main():
     except Exception as e:
         print(f"{DIM}[SemanticMemory no disponible: {e}]{RESET}")
         sem = None
+
+    summarizer_model = None
+    try:
+        summarizer_model = VLLaMA(model="Gemma-3-1B.gguf", auto_load=True)
+        print(f"{DIM}[Summarizer: {summarizer_model.model_name}]{RESET}")
+    except Exception as e:
+        print(f"{DIM}[Summarizer no disponible: {e}]{RESET}")
+
+    conv_summary = ConversationSummaryMemory(
+        sqlite_conn=mem._conn,
+        conversation_id="default",
+        max_messages=10,
+        model=summarizer_model,
+    )
 
     system_prompt = _ask_system_prompt(mem)
 
@@ -364,6 +378,8 @@ def main():
 
         # ── Chat ────────────────────────────────────────────
 
+        conv_summary.maybe_update()
+
         extra_context = ""
         mem_count = 0
         if sem:
@@ -374,7 +390,10 @@ def main():
                 extra_context = lines
                 print(f"{DIM}[{mem_count} memorias recuperadas]{RESET}")
 
-        full_system = mem.build_system_prompt(extra_context=extra_context)
+        full_system = mem.build_system_prompt(
+            extra_context=extra_context,
+            conv_summary_memory=conv_summary,
+        )
         if extra_context:
             log.warning("System prompt con memorias (%d chars):\n%s", len(full_system), full_system)
 
