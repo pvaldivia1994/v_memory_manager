@@ -156,6 +156,7 @@ def main():
     parser.add_argument("--model", help="Nombre o ruta del modelo GGUF")
     parser.add_argument("--no-stream", action="store_true", help="Deshabilitar streaming")
     parser.add_argument("--book", help="Ruta a PDF/EPUB/TXT para ingestar al iniciar")
+    parser.add_argument("--index", help="Archivo de indice (titulo|pagina) para definir capitulos")
     parser.add_argument("--extract", help="Solo extraer texto a TXT (no indexar)")
     parser.add_argument("--pdf-layout", default="",
                         choices=["", "plain", "blocks", "two_columns", "columns", "pymupdf4llm"],
@@ -225,11 +226,13 @@ def main():
                     extracted_dir = _ROOT / ".chatdb" / "extracted"
                     extracted_dir.mkdir(parents=True, exist_ok=True)
                     save_path = str(extracted_dir / book_path.with_suffix(".txt").name)
-                    bid = book_mem.ingest(
-                        str(book_path),
+                    ingest_kw = dict(
                         pdf_layout=args.pdf_layout,
                         save_extracted_to=save_path,
                     )
+                    if args.index:
+                        ingest_kw["index_path"] = args.index
+                    bid = book_mem.ingest(str(book_path), **ingest_kw)
                     b = book_mem.get_book(bid)
                     print(f"[Libro cargado: {b['title']} ({bid}) - {b['total_chunks']} chunks]")
                     print(f"[Texto extraido en: {save_path}]")
@@ -450,13 +453,18 @@ def main():
                     print(f"{DIM}─────────────────────{RESET}")
 
                 elif sub_cmd == "ingest":
-                    if not sub_arg:
-                        print("[Uso: /book ingest <ruta_al_pdf/txt>]")
+                    parts_cmd = sub_arg.split(maxsplit=1)
+                    ingest_path = parts_cmd[0]
+                    ingest_index = parts_cmd[1] if len(parts_cmd) > 1 else None
+                    if not ingest_path:
+                        print("[Uso: /book ingest <ruta> [archivo_indice]")
+                        print("  /book ingest libro.pdf")
+                        print("  /book ingest libro.pdf indice.txt")
                         continue
                     try:
-                        bid = book_mem.ingest(sub_arg)
+                        bid = book_mem.ingest(ingest_path, index_path=ingest_index)
                         book = book_mem.get_book(bid)
-                        print(f"[Libro indexado: {book['title']} ({bid}) - {book['total_chunks']} chunks]")
+                        print(f"[Libro indexado: {book['title']} ({bid}) - {book['total_chunks']} chunks, {book['total_chapters']} capitulos]")
                     except Exception as e:
                         print(f"[Error al ingestar: {e}]")
 

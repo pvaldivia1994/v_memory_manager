@@ -728,6 +728,7 @@ class BookMemory:
         force: bool = False,
         pdf_layout: str = "auto",
         save_extracted_to: Optional[str] = None,
+        index_path: Optional[str] = None,
     ) -> str:
         path_obj = Path(path)
         if not path_obj.exists():
@@ -786,7 +787,10 @@ class BookMemory:
 
         try:
             db.update_book(self.conn, book_id, status="chunking")
-            self._index_book(book_id, text)
+            if index_path:
+                self._index_book_from_file(book_id, text, index_path)
+            else:
+                self._index_book(book_id, text)
             db.update_book(self.conn, book_id, status="indexed")
         except Exception as e:
             db.update_book(self.conn, book_id, status="error",
@@ -917,6 +921,120 @@ class BookMemory:
                     chunk_text=section["text"], chunk_hash=child_hash,
                     parent_chunk_id=parent_chunk_id,
                     chapter=chapter_name,
+                    page_start=section["page_start"],
+                    page_end=section["page_end"],
+                    embedding=embedding_blob,
+                )
+                total_chunks += 1
+
+        db.update_book(self.conn, book_id, status="embedding",
+                       total_chapters=len(chapters),
+                       total_chunks=total_chunks)
+
+    # ── Index-based indexing ─────────────────────────────────────
+
+    @staticmethod
+    def parse_index(path: str) -> list[tuple[str, int]]:
+        entries: list[tuple[str, int]] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or "|" not in line:
+                    continue
+                title, page_str = line.rsplit("|", 1)
+                title = title.strip()
+                try:
+                    page = int(page_str.strip())
+                    entries.append((title, page))
+                except ValueError:
+                    continue
+        return entries
+
+    @staticmethod
+    def group_index_entries(entries: list[tuple[str, int]]) -> list[tuple[str, int, list[tuple[str, int]]]]:
+        chapters: list[tuple[str, int, list[tuple[str, int]]]] = []
+        current_chapter: Optional[tuple[str, int, list[tuple[str, int]]]] = None
+        for title, page in entries:
+            is_chapter = bool(re.match(r"(?:Ch\.|Chapter|Cap[ií]tulo)\s*\d+", title, re.IGNORECASE))
+            if is_chapter:
+                current_chapter = (title, page, [])
+                chapters.append(current_chapter)
+            elif current_chapter is not None:
+                current_chapter[2].append((title, page))
+            else:
+                current_chapter = (title, page, [])
+                chapters.append(current_chapter)
+        return chapters
+
+    def _get_page_text(self, full_text: str, page_num: int) -> str:
+        """Extract the text of a specific [PAGE N] from the full extracted text."""
+        pattern = re.escape(f"[PAGE {page_num}]")
+        next_pattern = re.escape(f"[PAGE {page_num + 1}]")
+        match = re.search(pattern + r"(.*?)(?:" + next_pattern + "|$)", full_text, re.DOTALL)
+        return match.group(1).strip() if match else ""
+
+    def _index_book_from_file(self, book_id: str, text: str, index_path: str) -> None:
+        entries = self.parse_index(index_path)
+        if not entries:
+            raise ValueError(f"Indice vacio o invalido: {index_path}")
+
+        chapters = self.group_index_entries(entries)
+        total_chunks = 0
+
+        for ch_index, (ch_title, ch_page, sections) in enumerate(chapters):
+            if ch_index + 1 < len(chapters):
+                next_page = chapters[ch_index + 1][1]
+            else:
+                next_page = None
+
+            chapter_parts: list[str] = []
+            p = ch_page
+            while next_page is None or p < next_page:
+                page_text = self._get_page_text(text, p)
+                if page_text:
+                    chapter_parts.append(f"[PAGE {p}]\n{page_text}")
+                p += 1
+                if p > 200:
+                    break
+
+            chapter_text = "\n\n".join(chapter_parts) if chapter_parts else ""
+            if not chapter_text.strip():
+                chapter_text = f"[PAGE {ch_page}]\n" + self._get_page_text(text, ch_page)
+
+            parent_chunk_id = _make_parent_chunk_id(book_id, ch_index)
+            parent_hash = _hash_text(chapter_text)
+
+            db.insert_book_chunk(
+                self.conn, parent_chunk_id, book_id,
+                level="chapter", chapter_index=ch_index, section_index=-1,
+                chunk_text=chapter_text, chunk_hash=parent_hash,
+                chapter=ch_title,
+                page_start=ch_page,
+                page_end=(next_page - 1) if next_page else ch_page,
+                embedding=None,
+            )
+
+            child_sections = chunk_text(
+                chapter_text,
+                chunk_size_chars=self.chunk_size_chars,
+                chunk_overlap_chars=self.chunk_overlap_chars,
+            )
+
+            for sec_index, section in enumerate(child_sections):
+                child_chunk_id = _make_child_chunk_id(book_id, ch_index, sec_index)
+                child_hash = _hash_text(section["text"])
+
+                if db.chunk_exists_by_hash(self.conn, book_id, child_hash):
+                    continue
+
+                embedding_blob = self._embed(section["text"])
+
+                db.insert_book_chunk(
+                    self.conn, child_chunk_id, book_id,
+                    level="section", chapter_index=ch_index, section_index=sec_index,
+                    chunk_text=section["text"], chunk_hash=child_hash,
+                    parent_chunk_id=parent_chunk_id,
+                    chapter=ch_title,
                     page_start=section["page_start"],
                     page_end=section["page_end"],
                     embedding=embedding_blob,

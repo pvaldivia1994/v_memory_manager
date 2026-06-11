@@ -450,6 +450,23 @@ def test_clean_markdown_pdf_text():
     print(f"[OK] clean_markdown_pdf_text: {len(lines)} lines")
 
 
+def test_parse_index():
+    """Parse index file format: title|page_number."""
+    from src.book_memory import BookMemory
+
+    entries = BookMemory.parse_index("tests/test_data/sample_index.txt")
+    assert len(entries) > 0, f"Expected entries, got {len(entries)}"
+    assert entries[0][1] > 0, f"Page number should be int: {entries[0]}"
+    assert "|" not in entries[0][0], f"Pipe should be stripped: {entries[0]}"
+    print(f"[OK] parse_index: {len(entries)} entries, first={entries[0]}")
+
+    grouped = BookMemory.group_index_entries(entries)
+    assert len(grouped) > 0, f"Expected chapters, got {len(grouped)}"
+    ch_title, ch_page, sections = grouped[0]
+    assert ch_page > 0, f"Chapter page missing: {ch_title}"
+    print(f"[OK] group_index_entries: {len(grouped)} chapters, first={ch_title} page={ch_page} sections={len(sections)}")
+
+
 def test_clean_extracted_text():
     text = "soft\u00ad\nhyphen\u00adned\n\n\n\n\nword"
     cleaned = clean_extracted_text(text)
