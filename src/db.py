@@ -88,40 +88,50 @@ CREATE TABLE IF NOT EXISTS conversation_summary_state (
 
 CREATE TABLE IF NOT EXISTS books (
     id              TEXT PRIMARY KEY,
+    user_id         TEXT NOT NULL DEFAULT 'default',
     title           TEXT NOT NULL DEFAULT '',
     author          TEXT NOT NULL DEFAULT '',
     source_path     TEXT NOT NULL,
-    source_hash     TEXT NOT NULL UNIQUE,
+    source_file_hash TEXT NOT NULL,
+    source_text_hash TEXT NOT NULL DEFAULT '',
+    source_type     TEXT NOT NULL DEFAULT '',
+    source_layout   TEXT NOT NULL DEFAULT '',
+    source_text_path TEXT NOT NULL DEFAULT '',
     total_pages     INTEGER NOT NULL DEFAULT 0,
+    total_chapters  INTEGER NOT NULL DEFAULT 0,
     total_chunks    INTEGER NOT NULL DEFAULT 0,
     language        TEXT NOT NULL DEFAULT 'es',
     status          TEXT NOT NULL DEFAULT 'pending',
     error_message   TEXT NOT NULL DEFAULT '',
     embedding_model TEXT NOT NULL DEFAULT '',
     embedding_dim   INTEGER NOT NULL DEFAULT 0,
-    chunker_version TEXT NOT NULL DEFAULT 'v1',
-    schema_version  TEXT NOT NULL DEFAULT 'v1',
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(source_file_hash, source_text_hash)
 );
 
 CREATE TABLE IF NOT EXISTS book_chunks (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     chunk_id        TEXT NOT NULL UNIQUE,
     book_id         TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    parent_chunk_id TEXT REFERENCES book_chunks(chunk_id),
+    level           TEXT NOT NULL CHECK(level IN ('chapter', 'section')),
     chapter         TEXT NOT NULL DEFAULT '',
+    chapter_index   INTEGER NOT NULL DEFAULT 0,
+    section_index   INTEGER NOT NULL DEFAULT 0,
     page_start      INTEGER NOT NULL DEFAULT 0,
     page_end        INTEGER NOT NULL DEFAULT 0,
-    chunk_index     INTEGER NOT NULL,
     chunk_text      TEXT NOT NULL,
-    token_count     INTEGER NOT NULL DEFAULT 0,
     char_count      INTEGER NOT NULL DEFAULT 0,
-    chunk_hash      TEXT NOT NULL,
+    chunk_hash      TEXT NOT NULL DEFAULT '',
+    embedding       BLOB,
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_book_chunks_book_id ON book_chunks(book_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_book_chunks_book_index ON book_chunks(book_id, chunk_index);
+CREATE INDEX IF NOT EXISTS idx_book_chunks_parent ON book_chunks(parent_chunk_id);
+CREATE INDEX IF NOT EXISTS idx_book_chunks_book_chapter ON book_chunks(book_id, chapter_index);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_book_chunks_book_section ON book_chunks(book_id, chapter_index, section_index);
 CREATE INDEX IF NOT EXISTS idx_book_chunks_hash ON book_chunks(chunk_hash);"""
 
 
@@ -133,18 +143,6 @@ def _conn(db_path: str) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA_SQL)
     conn.commit()
-    _ensure_fts5(conn)
-
-
-def _ensure_fts5(conn: sqlite3.Connection) -> None:
-    try:
-        conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS book_chunks_fts
-            USING fts5(chunk_text, book_id UNINDEXED, chunk_id UNINDEXED, chapter UNINDEXED)
-        """)
-        conn.commit()
-    except Exception:
-        pass
 
 
 def verify_schema(conn: sqlite3.Connection) -> None:
@@ -234,21 +232,26 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS books (
             id              TEXT PRIMARY KEY,
+            user_id         TEXT NOT NULL DEFAULT 'default',
             title           TEXT NOT NULL DEFAULT '',
             author          TEXT NOT NULL DEFAULT '',
             source_path     TEXT NOT NULL,
-            source_hash     TEXT NOT NULL UNIQUE,
+            source_file_hash TEXT NOT NULL,
+            source_text_hash TEXT NOT NULL DEFAULT '',
+            source_type     TEXT NOT NULL DEFAULT '',
+            source_layout   TEXT NOT NULL DEFAULT '',
+            source_text_path TEXT NOT NULL DEFAULT '',
             total_pages     INTEGER NOT NULL DEFAULT 0,
+            total_chapters  INTEGER NOT NULL DEFAULT 0,
             total_chunks    INTEGER NOT NULL DEFAULT 0,
             language        TEXT NOT NULL DEFAULT 'es',
             status          TEXT NOT NULL DEFAULT 'pending',
             error_message   TEXT NOT NULL DEFAULT '',
             embedding_model TEXT NOT NULL DEFAULT '',
             embedding_dim   INTEGER NOT NULL DEFAULT 0,
-            chunker_version TEXT NOT NULL DEFAULT 'v1',
-            schema_version  TEXT NOT NULL DEFAULT 'v1',
             created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(source_file_hash, source_text_hash)
         )
     """)
 
@@ -257,29 +260,26 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             chunk_id        TEXT NOT NULL UNIQUE,
             book_id         TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            parent_chunk_id TEXT REFERENCES book_chunks(chunk_id),
+            level           TEXT NOT NULL CHECK(level IN ('chapter', 'section')),
             chapter         TEXT NOT NULL DEFAULT '',
+            chapter_index   INTEGER NOT NULL DEFAULT 0,
+            section_index   INTEGER NOT NULL DEFAULT 0,
             page_start      INTEGER NOT NULL DEFAULT 0,
             page_end        INTEGER NOT NULL DEFAULT 0,
-            chunk_index     INTEGER NOT NULL,
             chunk_text      TEXT NOT NULL,
-            token_count     INTEGER NOT NULL DEFAULT 0,
             char_count      INTEGER NOT NULL DEFAULT 0,
-            chunk_hash      TEXT NOT NULL,
+            chunk_hash      TEXT NOT NULL DEFAULT '',
+            embedding       BLOB,
             created_at      TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """)
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_book_id ON book_chunks(book_id)")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_book_chunks_book_index ON book_chunks(book_id, chunk_index)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_parent ON book_chunks(parent_chunk_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_book_chapter ON book_chunks(book_id, chapter_index)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_book_chunks_book_section ON book_chunks(book_id, chapter_index, section_index)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_hash ON book_chunks(chunk_hash)")
-
-    try:
-        conn.execute("""
-            CREATE VIRTUAL TABLE IF NOT EXISTS book_chunks_fts
-            USING fts5(chunk_text, book_id UNINDEXED, chunk_id UNINDEXED, chapter UNINDEXED)
-        """)
-    except Exception:
-        pass
 
     conn.commit()
 
@@ -505,24 +505,29 @@ def get_messages_range(
 # ── Books ────────────────────────────────────────────────────
 
 BOOK_COLS = [
-    "id", "title", "author", "source_path", "source_hash",
-    "total_pages", "total_chunks", "language", "status",
-    "error_message", "embedding_model", "embedding_dim",
-    "chunker_version", "schema_version", "created_at", "updated_at",
+    "id", "user_id", "title", "author", "source_path",
+    "source_file_hash", "source_text_hash",
+    "source_type", "source_layout", "source_text_path",
+    "total_pages", "total_chapters", "total_chunks", "language",
+    "status", "error_message", "embedding_model", "embedding_dim",
+    "created_at", "updated_at",
 ]
 
 BOOK_CHUNK_COLS = [
-    "id", "chunk_id", "book_id", "chapter", "page_start",
-    "page_end", "chunk_index", "chunk_text", "token_count",
-    "char_count", "chunk_hash", "created_at",
+    "id", "chunk_id", "book_id", "parent_chunk_id", "level",
+    "chapter", "chapter_index", "section_index",
+    "page_start", "page_end", "chunk_text",
+    "char_count", "chunk_hash", "embedding", "created_at",
 ]
 
 
-def insert_book(conn: sqlite3.Connection, book_id: str, source_path: str, source_hash: str, **kwargs) -> None:
+def insert_book(conn: sqlite3.Connection, book_id: str, source_path: str, source_file_hash: str,
+                user_id: str = "default", **kwargs) -> None:
     fields = {
         "id": book_id,
+        "user_id": user_id,
         "source_path": source_path,
-        "source_hash": source_hash,
+        "source_file_hash": source_file_hash,
         **{k: v for k, v in kwargs.items() if k in BOOK_COLS},
     }
     cols = ", ".join(fields.keys())
@@ -546,13 +551,26 @@ def get_book(conn: sqlite3.Connection, book_id: str) -> Optional[dict]:
     return dict(row) if row else None
 
 
-def get_book_by_hash(conn: sqlite3.Connection, source_hash: str) -> Optional[dict]:
-    row = conn.execute("SELECT * FROM books WHERE source_hash=?", (source_hash,)).fetchone()
+def get_book_by_hashes(conn: sqlite3.Connection, source_file_hash: str,
+                       source_text_hash: str) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM books WHERE source_file_hash=? AND source_text_hash=?",
+        (source_file_hash, source_text_hash),
+    ).fetchone()
     return dict(row) if row else None
 
 
-def list_books(conn: sqlite3.Connection) -> list[dict]:
-    rows = conn.execute("SELECT * FROM books ORDER BY created_at DESC").fetchall()
+def get_book_by_file_hash(conn: sqlite3.Connection, source_file_hash: str) -> Optional[dict]:
+    row = conn.execute(
+        "SELECT * FROM books WHERE source_file_hash=?", (source_file_hash,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_books(conn: sqlite3.Connection, user_id: str = "default") -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM books WHERE user_id=? ORDER BY created_at DESC", (user_id,)
+    ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -562,30 +580,38 @@ def delete_book(conn: sqlite3.Connection, book_id: str) -> None:
     conn.commit()
 
 
-def count_books(conn: sqlite3.Connection) -> int:
-    return conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
+def count_books(conn: sqlite3.Connection, user_id: str = "default") -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM books WHERE user_id=?", (user_id,)
+    ).fetchone()[0]
 
 
-def has_books(conn: sqlite3.Connection) -> bool:
-    return count_books(conn) > 0
+def has_books(conn: sqlite3.Connection, user_id: str = "default") -> bool:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM books WHERE status='indexed' AND user_id=?", (user_id,)
+    ).fetchone()
+    return row[0] > 0 if row else False
 
 
-def insert_book_chunk(conn: sqlite3.Connection, chunk_id: str, book_id: str, chunk_index: int,
+def insert_book_chunk(conn: sqlite3.Connection, chunk_id: str, book_id: str,
+                      level: str, chapter_index: int, section_index: int,
                       chunk_text: str, chunk_hash: str, **kwargs) -> None:
     fields = {
         "chunk_id": chunk_id, "book_id": book_id,
-        "chunk_index": chunk_index, "chunk_text": chunk_text, "chunk_hash": chunk_hash,
+        "level": level, "chapter_index": chapter_index,
+        "section_index": section_index,
+        "chunk_text": chunk_text, "chunk_hash": chunk_hash,
         "char_count": len(chunk_text),
         **{k: v for k, v in kwargs.items() if k in BOOK_CHUNK_COLS},
     }
     cols = ", ".join(fields.keys())
     placeholders = ", ".join("?" for _ in fields)
-    conn.execute(f"INSERT INTO book_chunks ({cols}) VALUES ({placeholders})", list(fields.values()))
+    conn.execute(f"INSERT OR REPLACE INTO book_chunks ({cols}) VALUES ({placeholders})", list(fields.values()))
 
 
 def get_book_chunks(conn: sqlite3.Connection, book_id: str, limit: int = 1000) -> list[dict]:
     rows = conn.execute(
-        "SELECT * FROM book_chunks WHERE book_id=? ORDER BY chunk_index ASC LIMIT ?",
+        "SELECT * FROM book_chunks WHERE book_id=? ORDER BY chapter_index ASC, section_index ASC LIMIT ?",
         (book_id, limit),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -607,59 +633,46 @@ def count_book_chunks(conn: sqlite3.Connection, book_id: str) -> int:
     ).fetchone()[0]
 
 
-# ── Book FTS5 ─────────────────────────────────────────────────
+def count_book_chapters(conn: sqlite3.Connection, book_id: str) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM book_chunks WHERE book_id=? AND level='chapter'", (book_id,)
+    ).fetchone()[0]
 
 
-def insert_book_chunk_fts(conn: sqlite3.Connection, chunk_id: str, book_id: str,
-                          chunk_text: str, chapter: str) -> None:
-    try:
-        conn.execute(
-            "INSERT INTO book_chunks_fts (chunk_text, book_id, chunk_id, chapter) VALUES (?, ?, ?, ?)",
-            (chunk_text, book_id, chunk_id, chapter),
-        )
-        conn.commit()
-    except Exception:
-        pass
+def chunk_exists_by_hash(conn: sqlite3.Connection, book_id: str, chunk_hash: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM book_chunks WHERE book_id=? AND chunk_hash=? LIMIT 1",
+        (book_id, chunk_hash),
+    ).fetchone()
+    return row is not None
 
 
-def delete_book_chunk_fts(conn: sqlite3.Connection, chunk_id: str) -> None:
-    try:
-        conn.execute("DELETE FROM book_chunks_fts WHERE chunk_id=?", (chunk_id,))
-        conn.commit()
-    except Exception:
-        pass
+def get_parent_by_chunk_id(conn: sqlite3.Connection, chunk_id: str) -> Optional[dict]:
+    row = conn.execute("""
+        SELECT p.* FROM book_chunks p
+        JOIN book_chunks c ON c.parent_chunk_id = p.chunk_id
+        WHERE c.chunk_id = ?
+    """, (chunk_id,)).fetchone()
+    return dict(row) if row else None
 
 
-def delete_book_chunks_fts(conn: sqlite3.Connection, book_id: str) -> None:
-    try:
-        conn.execute("DELETE FROM book_chunks_fts WHERE book_id=?", (book_id,))
-        conn.commit()
-    except Exception:
-        pass
+def get_chapter_chunks(conn: sqlite3.Connection, book_id: str,
+                       chapter_index: int) -> list[dict]:
+    rows = conn.execute(
+        "SELECT * FROM book_chunks WHERE book_id=? AND chapter_index=? AND level='section' ORDER BY section_index",
+        (book_id, chapter_index),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
-def search_book_chunks_fts(conn: sqlite3.Connection, query: str, n_results: int = 5,
-                           book_id: Optional[str] = None) -> list[dict]:
-    try:
-        if book_id:
-            rows = conn.execute(
-                "SELECT bc.*, rank FROM book_chunks_fts "
-                "JOIN book_chunks bc ON book_chunks_fts.chunk_id = bc.chunk_id "
-                "WHERE book_chunks_fts MATCH ? AND book_chunks_fts.book_id = ? "
-                "ORDER BY rank LIMIT ?",
-                (query, book_id, n_results),
-            ).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT bc.*, rank FROM book_chunks_fts "
-                "JOIN book_chunks bc ON book_chunks_fts.chunk_id = bc.chunk_id "
-                "WHERE book_chunks_fts MATCH ? "
-                "ORDER BY rank LIMIT ?",
-                (query, n_results),
-            ).fetchall()
-        return [dict(r) for r in rows]
-    except Exception:
-        return []
+def list_chapters(conn: sqlite3.Connection, book_id: str) -> list[dict]:
+    rows = conn.execute("""
+        SELECT chunk_id, chapter, chapter_index, page_start, page_end, char_count
+        FROM book_chunks
+        WHERE book_id=? AND level='chapter'
+        ORDER BY chapter_index
+    """, (book_id,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_first_window_message_id(

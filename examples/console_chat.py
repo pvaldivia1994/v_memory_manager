@@ -16,8 +16,8 @@ logging.basicConfig(
 log = logging.getLogger("chat")
 
 _ROOT = Path(__file__).resolve().parent.parent
-_CHROMA_DIR = _ROOT / ".chatdb" / "chroma"
 _VLLAMA = _ROOT.parent / "v_llama"
+_CHROMA_DIR = _ROOT / ".chatdb" / "chroma"
 
 # ── importar v_llama ─────────────────────────────────────
 if not _VLLAMA.exists():
@@ -108,31 +108,11 @@ def _pick_model(llm) -> str:
         print(f"  Opción inválida. Elija entre 1 y {len(models)}.")
 
 
-def _clear_chroma(chroma_dir: Path, book_mem: Any = None) -> None:
-    if not chroma_dir.exists():
-        return
-    try:
-        import chromadb
-        client = chromadb.PersistentClient(path=str(chroma_dir))
-        for coll_name in ["semantic_memories"]:
-            try:
-                client.delete_collection(coll_name)
-            except Exception:
-                pass
-        print(f"[ChromaDB: colecciones semanticas limpiadas]")
-    except Exception:
-        shutil.rmtree(chroma_dir)
-        chroma_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[ChromaDB limpiada]")
-
-
-def _ask_continue(db_path: Path, mem: MemoryManager, chroma_dir: Path | None = None) -> None:
+def _ask_continue(db_path: Path, mem: MemoryManager) -> None:
     if not db_path.exists():
         db_path.parent.mkdir(parents=True, exist_ok=True)
         mem.create_memory_db(str(db_path))
         print(f"[Memoria creada: {db_path.name}]")
-        if chroma_dir:
-            _clear_chroma(chroma_dir)
         return
 
     mem.load_memory_db(str(db_path))
@@ -148,8 +128,6 @@ def _ask_continue(db_path: Path, mem: MemoryManager, chroma_dir: Path | None = N
         print(f"{DIM}──────────────────────{RESET}")
     else:
         mem.clear_memory_db()
-        if chroma_dir:
-            _clear_chroma(chroma_dir)
         print("[DB reiniciada]")
 
 
@@ -179,9 +157,9 @@ def main():
     parser.add_argument("--no-stream", action="store_true", help="Deshabilitar streaming")
     parser.add_argument("--book", help="Ruta a PDF/EPUB/TXT para ingestar al iniciar")
     parser.add_argument("--extract", help="Solo extraer texto a TXT (no indexar)")
-    parser.add_argument("--pdf-layout", default="auto",
-                        choices=["plain", "blocks", "two_columns", "auto"],
-                        help="Layout de PDF: plain, blocks, two_columns, auto")
+    parser.add_argument("--pdf-layout", default="",
+                        choices=["", "plain", "blocks", "two_columns", "columns", "pymupdf4llm"],
+                        help="Layout: '' (pymupdf4llm + fallback), plain, blocks, columns")
     args = parser.parse_args()
 
     # ── v_llama ────────────────────────────────────────────────
@@ -198,7 +176,7 @@ def main():
 
     # ── Memoria ────────────────────────────────────────────────
     mem = MemoryManager()
-    _ask_continue(Path(args.db), mem, _CHROMA_DIR)
+    _ask_continue(Path(args.db), mem)
     mem.set_config("model_name", llm.model_name)
 
     try:
@@ -213,7 +191,7 @@ def main():
 
     if args.extract:
         try:
-            bm_temp = BookMemory(persist_dir=str(_CHROMA_DIR))
+            bm_temp = BookMemory(sqlite_conn=mem._conn)
             out = bm_temp.extract_to_txt(
                 args.extract,
                 str(_ROOT / ".chatdb" / "extracted" / Path(args.extract).with_suffix(".txt").name),
@@ -224,10 +202,19 @@ def main():
             print(f"[Error al extraer: {e}]")
         return
 
+    embed_fn = None
+    try:
+        from sentence_transformers import SentenceTransformer
+        _EMBED_MODEL = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
+        def embed_fn(text: str) -> list[float]:
+            return _EMBED_MODEL.encode(text).tolist()
+    except ImportError:
+        print(f"{DIM}[Embedding no disponible: pip install sentence-transformers]{RESET}")
+
     try:
         book_mem = BookMemory(
-            persist_dir=str(_CHROMA_DIR),
             sqlite_conn=mem._conn,
+            embed_fn=embed_fn,
         )
         if args.book:
             book_path = Path(args.book)
@@ -439,11 +426,14 @@ def main():
                     print("[BookMemory no disponible]")
                     continue
                 if len(parts) < 2:
-                    print("[Uso: /book <consulta>]")
-                    print("  /book list             - Listar libros indexados")
-                    print("  /book ingest <ruta>    - Ingestar un PDF/TXT")
-                    print("  /book search <consulta> - Buscar en libros")
-                    print("  /book stats            - Estadisticas")
+                    print("[Uso: /book <comando>]")
+                    print("  /book list                  - Listar libros indexados")
+                    print("  /book ingest <ruta>         - Ingestar un PDF/TXT")
+                    print("  /book search <consulta>     - Buscar en libros")
+                    print("  /book chapters <book_id>    - Listar capitulos")
+                    print("  /book chapter <id> <N>      - Inyectar capitulo completo")
+                    print("  /book delete <book_id>      - Eliminar libro")
+                    print("  /book stats                 - Estadisticas")
                     continue
                 sub = parts[1].split(maxsplit=1)
                 sub_cmd = sub[0].lower()
@@ -456,7 +446,7 @@ def main():
                         continue
                     print(f"\n{DIM}── Libros ({len(books)}) ──{RESET}")
                     for b in books:
-                        print(f"  {b['id']}: {b['title']} ({b['status']}, {b['total_chunks']} chunks)")
+                        print(f"  {b['id']}: {b['title']} ({b['status']}, {b['total_chunks']} chunks, {b['total_chapters']} capitulos)")
                     print(f"{DIM}─────────────────────{RESET}")
 
                 elif sub_cmd == "ingest":
@@ -479,6 +469,39 @@ def main():
                         print("[Sin resultados en libros]")
                         continue
                     print(f"\n{DIM}── Resultados en libros ──{RESET}")
+                    print(ctx)
+                    print(f"{DIM}─────────────────────────{RESET}")
+
+                elif sub_cmd == "chapters":
+                    if not sub_arg:
+                        print("[Uso: /book chapters <book_id>]")
+                        print("  /book list  - para ver los IDs")
+                        continue
+                    chapters = book_mem.list_chapters(sub_arg)
+                    if not chapters:
+                        print("[No hay capitulos en este libro]")
+                        continue
+                    print(f"\n{DIM}── Capitulos de {sub_arg} ──{RESET}")
+                    for ch in chapters:
+                        print(f"  [{ch.chapter_index}] {ch.chapter} ({ch.char_count}c, pag {ch.page_start}-{ch.page_end})")
+                    print(f"{DIM}──────────────────────────{RESET}")
+
+                elif sub_cmd == "chapter":
+                    ch_parts = sub_arg.split(maxsplit=1)
+                    if len(ch_parts) < 2:
+                        print("[Uso: /book chapter <book_id> <N>]")
+                        continue
+                    ch_book_id = ch_parts[0]
+                    try:
+                        ch_index = int(ch_parts[1])
+                    except ValueError:
+                        print("[El indice debe ser un numero. Usa /book chapters <book_id>]")
+                        continue
+                    ctx = book_mem.build_chapter_context(ch_book_id, ch_index, max_chars=5000)
+                    if not ctx:
+                        print("[Capitulo no encontrado]")
+                        continue
+                    print(f"\n{DIM}── Capitulo {ch_index} ──{RESET}")
                     print(ctx)
                     print(f"{DIM}─────────────────────────{RESET}")
 

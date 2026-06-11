@@ -4,13 +4,16 @@ import hashlib
 import logging
 import re
 import sqlite3
+import struct
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+import numpy as np
 
 from . import db
-from .book_models import BookChunk
+from .book_models import BookChunk, ChapterInfo
 
 log = logging.getLogger("book_memory")
 
@@ -36,6 +39,11 @@ _HYPHENATION = re.compile(r"(\w)-\n(\w)")
 _MULTI_SPACE = re.compile(r"[ \t]+")
 _MULTI_NEWLINE = re.compile(r"\n{3,}")
 
+_MAX_CHAPTER_WORDS = 4000
+
+CHARS_PER_TOKEN = 3.0
+SAFETY_MARGIN = 0.85
+
 
 def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -53,8 +61,34 @@ def _generate_book_id() -> str:
     return f"book_{uuid.uuid4().hex[:12]}"
 
 
-def _make_chunk_id(book_id: str, chunk_index: int) -> str:
-    return f"{book_id}_chunk_{chunk_index:06d}"
+def _make_parent_chunk_id(book_id: str, ch_index: int) -> str:
+    return f"{book_id}_ch_{ch_index:04d}"
+
+
+def _make_child_chunk_id(book_id: str, ch_index: int, sec_index: int) -> str:
+    return f"{book_id}_ch_{ch_index:04d}_s_{sec_index:04d}"
+
+
+def _embedding_to_blob(vector: list[float]) -> bytes:
+    arr = np.array(vector, dtype=np.float32)
+    return arr.tobytes()
+
+
+def _blob_to_embedding(blob: bytes) -> np.ndarray:
+    return np.frombuffer(blob, dtype=np.float32)
+
+
+def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(np.dot(a, b) / (norm_a * norm_b))
+
+
+def get_max_chars_for_context(model_context_window: int, reserved_tokens: int = 1024) -> int:
+    available = (model_context_window - reserved_tokens) * SAFETY_MARGIN
+    return int(available * CHARS_PER_TOKEN)
 
 
 # ── Text cleaning ─────────────────────────────────────────────
@@ -64,8 +98,29 @@ def clean_extracted_text(text: str) -> str:
     text = text.replace("\u00ad\n", "")
     text = text.replace("\u00ad", "")
     text = _HYPHENATION.sub(r"\1\2", text)
-    text = _MULTI_SPACE.sub(" ", text)
+    lines = []
+    for line in text.splitlines():
+        line = re.sub(r"[ \t]+", " ", line).strip()
+        lines.append(line)
+    text = "\n".join(lines)
     text = _MULTI_NEWLINE.sub("\n\n", text)
+    return text.strip()
+
+
+_TOC_ENTRY = re.compile(
+    r"(?P<title>(?:Ch\.\s*)?\d*\.?\s*[A-ZÁÉÍÓÚÑa-záéíóúñ][^.\n]{2,80}?)"
+    r"\s*\.{2,}\s*(?P<page>\d{1,4})",
+)
+
+_MARKDOWN_BOLD = re.compile(r"\*\*(.*?)\*\*")
+
+
+def clean_markdown_pdf_text(text: str) -> str:
+    text = _MARKDOWN_BOLD.sub(r"\1", text)
+    text = _TOC_ENTRY.sub(lambda m: f"{m.group('title').strip()}........................{m.group('page')}\n", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n[ \t]+", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
 
@@ -84,22 +139,41 @@ def extract_txt(path: str) -> tuple[str, int]:
     )
 
 
-def extract_pdf(path: str, layout: str = "plain") -> tuple[str, int]:
+def extract_pdf(path: str, layout: str = "") -> tuple[str, int]:
+    if not layout or layout in ("llm", "pymupdf4llm", "markdown", "auto"):
+        try:
+            import pymupdf4llm
+            import pymupdf
+            doc = pymupdf.open(path)
+            chunks = pymupdf4llm.to_markdown(path, page_chunks=True)
+            pages = []
+            for chunk in chunks:
+                page_num = chunk.get("metadata", {}).get("page_number", 0)
+                text = chunk.get("text", "").strip()
+                if text:
+                    text = clean_markdown_pdf_text(text)
+                    pages.append(f"[PAGE {page_num}]\n{text}")
+            return "\n\n".join(pages), len(doc)
+        except ImportError:
+            try:
+                import pymupdf
+            except ImportError:
+                raise ImportError("pymupdf no instalado. Ejecuta: pip install pymupdf")
+            return _extract_pdf_columns(path)
+
     try:
         import pymupdf
     except ImportError:
-        raise ImportError(
-            "pymupdf no esta instalado. Ejecuta: pip install pymupdf"
-        )
+        raise ImportError("pymupdf no esta instalado. Ejecuta: pip install pymupdf")
 
-    if layout == "plain":
+    if layout in ("plain", "raw"):
         return _extract_pdf_plain(path)
-    if layout == "blocks":
+    if layout in ("blocks", "single"):
         return _extract_pdf_blocks(path)
-    if layout == "two_columns":
+    if layout in ("two_columns", "2col"):
         return _extract_pdf_two_columns(path)
-    if layout == "auto":
-        return _extract_pdf_auto(path)
+    if layout in ("columns",):
+        return _extract_pdf_columns(path)
     raise ValueError(f"Layout no soportado: {layout}")
 
 
@@ -130,31 +204,89 @@ def _extract_pdf_blocks(path: str) -> tuple[str, int]:
     return "\n\n".join(pages), len(doc)
 
 
-def _extract_pdf_auto(path: str) -> tuple[str, int]:
+def _cluster_by_x0(normal_blocks: list, page_width: float) -> tuple[list[list[float]], list[float]]:
+    """Cluster blocks by x0 position and compute column centers."""
+    xs = sorted(set(b[0] for b in normal_blocks))
+    if not xs:
+        return [], []
+    clusters: list[list[float]] = []
+    gap = page_width * 0.12
+    for x in xs:
+        if not clusters:
+            clusters.append([x])
+        else:
+            current_center = sum(clusters[-1]) / len(clusters[-1])
+            if abs(x - current_center) > gap:
+                clusters.append([x])
+            else:
+                clusters[-1].append(x)
+    clusters = clusters[:4]
+    centers = [sum(c) / len(c) for c in clusters]
+    return clusters, centers
+
+
+def _extract_page_blocks(page, page_num: int) -> str:
+    """Extract text from a page handling mixed 1/2/3 column layouts."""
+    import pymupdf
+    blocks = page.get_text("blocks")
+    page_width = page.rect.width
+    page_height = page.rect.height
+
+    normal_blocks: list[tuple[float, float, float, float, str]] = []
+    top_full: list[tuple[float, float, str]] = []
+    bottom_full: list[tuple[float, float, str]] = []
+
+    for b in blocks:
+        x0, y0, x1, y1, text, *_ = b
+        text = text.strip()
+        if not text:
+            continue
+        block_width = x1 - x0
+        is_real_full = block_width > page_width * 0.80 and x0 < page_width * 0.15
+
+        if is_real_full and y0 > page_height * 0.55:
+            bottom_full.append((y0, x0, text))
+            continue
+        if is_real_full and y0 < page_height * 0.12:
+            top_full.append((y0, x0, text))
+            continue
+
+        normal_blocks.append((x0, y0, x1, y1, text))
+
+    if not normal_blocks and not bottom_full and not top_full:
+        return ""
+
+    clusters, centers = _cluster_by_x0(normal_blocks, page_width)
+
+    columns: list[list[tuple[float, float, str]]] = [[] for _ in centers]
+    for x0, y0, x1, y1, text in normal_blocks:
+        col_idx = min(range(len(centers)), key=lambda i: abs(x0 - centers[i]))
+        columns[col_idx].append((y0, x0, text))
+
+    page_lines: list[str] = []
+    for _, _, text in sorted(top_full, key=lambda x: (x[0], x[1])):
+        page_lines.append(text)
+    for col in columns:
+        col.sort(key=lambda x: (x[0], x[1]))
+        page_lines.extend(text for _, _, text in col)
+    for _, _, text in sorted(bottom_full, key=lambda x: (x[0], x[1])):
+        page_lines.append(text)
+
+    if not page_lines:
+        return ""
+    return f"[PAGE {page_num}]\n" + "\n\n".join(page_lines)
+
+
+def _extract_pdf_columns(path: str) -> tuple[str, int]:
+    """Extract PDF with per-page multi-column detection (1, 2, or 3 columns)."""
     import pymupdf
     doc = pymupdf.open(path)
-    two_column_pages = 0
-    total_pages = len(doc)
-
-    for page in doc:
-        if _page_looks_two_columns(page):
-            two_column_pages += 1
-
-    if total_pages > 0 and (two_column_pages / total_pages) >= 0.30:
-        return _extract_pdf_two_columns(path)
-    return _extract_pdf_blocks(path)
-
-
-def _page_looks_two_columns(page) -> bool:
-    blocks = page.get_text("blocks")
-    xs = [b[0] for b in blocks if b[4].strip()]
-    if len(xs) < 6:
-        return False
-    page_width = page.rect.width
-    middle = page_width / 2
-    left_count = sum(1 for x in xs if x < middle)
-    right_count = sum(1 for x in xs if x >= middle)
-    return left_count >= 3 and right_count >= 3
+    pages = []
+    for i, page in enumerate(doc):
+        text = _extract_page_blocks(page, i + 1)
+        if text:
+            pages.append(text)
+    return "\n\n".join(pages), len(doc)
 
 
 def _extract_pdf_two_columns(path: str) -> tuple[str, int]:
@@ -335,6 +467,91 @@ def _ocr_paddle(doc, total_pages: int) -> tuple[str, int]:
     return "\n\n".join(pages), total_pages
 
 
+# ── Chapter detection ──────────────────────────────────────────
+
+
+def _find_chapter_number(name: str) -> Optional[int]:
+    """Extract chapter number from a marker like 'Chapter 1' or 'Capítulo 3'."""
+    m = re.search(r'(?:Chapter|Cap[ií]tulo|Section|Tema|Parte)\s+(\d+)', name, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _detect_chapter_forward(text: str) -> list[tuple[int, int, str]]:
+    """Find chapter boundaries using regex patterns.
+    Only the FIRST occurrence of each chapter number is a real boundary.
+    Duplicates (headers, cross-refs) are ignored.
+    Returns [(start_char, end_char, chapter_name)]."""
+    raw_markers: list[tuple[int, str]] = []
+
+    for pattern in _CHAPTER_PATTERNS:
+        for match in pattern.finditer(text):
+            pos = match.start()
+            name = match.group(0).strip().rstrip(":")
+            if len(name) < 100:
+                raw_markers.append((pos, name))
+
+    if not raw_markers:
+        return []
+
+    raw_markers.sort(key=lambda x: x[0])
+
+    seen_numbers: set[int] = set()
+    unique_markers: list[tuple[int, str]] = []
+    for pos, name in raw_markers:
+        ch_num = _find_chapter_number(name)
+        if ch_num is not None:
+            if ch_num in seen_numbers:
+                continue
+            seen_numbers.add(ch_num)
+
+        if unique_markers and pos - unique_markers[-1][0] < 10:
+            continue
+
+        unique_markers.append((pos, name))
+
+    if not unique_markers:
+        return []
+
+    MIN_CHAPTER_CHARS = 100
+    chapters: list[tuple[int, int, str]] = []
+    for i, (pos, name) in enumerate(unique_markers):
+        end = unique_markers[i + 1][0] if i + 1 < len(unique_markers) else len(text)
+        chapters.append((pos, end, name))
+
+    chapters = [(s, e, n) for s, e, n in chapters if e - s >= MIN_CHAPTER_CHARS]
+
+    return chapters
+
+
+def _fallback_by_word_count(text: str, max_words: int = _MAX_CHAPTER_WORDS) -> list[tuple[int, int, str]]:
+    words = text.split()
+    chapters = []
+    start = 0
+    ch_index = 0
+
+    for i in range(0, len(words), max_words):
+        chunk_words = words[i:i + max_words]
+        end = len(" ".join(words[:i + len(chunk_words)]))
+        if i == 0:
+            name = "Inicio"
+        else:
+            ch_index += 1
+            name = f"Parte {ch_index}"
+        chapters.append((start, end, name))
+        start = end
+
+    return chapters
+
+
+def detect_chapters(text: str) -> list[tuple[int, int, str]]:
+    chapters = _detect_chapter_forward(text)
+    if not chapters:
+        chapters = _fallback_by_word_count(text)
+    return chapters
+
+
 # ── Chunking ───────────────────────────────────────────────────
 
 
@@ -355,25 +572,14 @@ def _detect_pages(text: str) -> list[dict]:
     return pages
 
 
-def _detect_chapter(text: str) -> str:
-    for pattern in _CHAPTER_PATTERNS:
-        match = pattern.search(text)
-        if match:
-            candidate = match.group(0).strip().rstrip(":")
-            if len(candidate) < 100:
-                return candidate
-    return ""
-
-
 def chunk_text(
     text: str,
-    chunk_size_chars: int = 1000,
-    chunk_overlap_chars: int = 200,
+    chunk_size_chars: int = 800,
+    chunk_overlap_chars: int = 150,
 ) -> list[dict]:
     page_blocks = _detect_pages(text)
     chunks = []
     buffer = ""
-    current_chapter = ""
     current_page_start = 1
     current_page_end = 1
 
@@ -387,24 +593,8 @@ def chunk_text(
             if not para:
                 continue
 
-            detected_chapter = _detect_chapter(para)
-
-            if detected_chapter and buffer.strip():
-                chunks.append({
-                    "chapter": current_chapter,
-                    "page_start": current_page_start,
-                    "page_end": current_page_end,
-                    "text": buffer.strip(),
-                })
-                buffer = ""
-                current_page_start = page_num
-
-            if detected_chapter:
-                current_chapter = detected_chapter
-
             if len(buffer) + len(para) > chunk_size_chars and buffer:
                 chunks.append({
-                    "chapter": current_chapter,
                     "page_start": current_page_start,
                     "page_end": current_page_end,
                     "text": buffer.strip(),
@@ -418,21 +608,12 @@ def chunk_text(
 
     if buffer.strip():
         chunks.append({
-            "chapter": current_chapter,
             "page_start": current_page_start,
             "page_end": current_page_end,
             "text": buffer.strip(),
         })
 
-    merged = []
-    for c in chunks:
-        if len(c["text"]) < 50 and merged:
-            merged[-1]["text"] += "\n\n" + c["text"]
-            merged[-1]["page_end"] = c["page_end"]
-        else:
-            merged.append(c)
-
-    return merged
+    return chunks
 
 
 # ── Triggers ───────────────────────────────────────────────────
@@ -458,57 +639,39 @@ def should_search_books(query: str) -> bool:
 class BookMemory:
     def __init__(
         self,
-        persist_dir: str = "./chroma_db",
         sqlite_conn: Optional[sqlite3.Connection] = None,
-        collection_name: str = "book_memory",
-        chunk_size_chars: int = 1000,
-        chunk_overlap_chars: int = 200,
+        embed_fn: Optional[Callable[[str], list[float]]] = None,
+        user_id: str = "default",
+        chunk_size_chars: int = 800,
+        chunk_overlap_chars: int = 150,
         search_max_distance: float = 0.75,
+        embedding_dim: int = 0,
     ):
-        self._persist_dir = persist_dir
-        self._conn: Optional[sqlite3.Connection] = sqlite_conn
-        self._collection_name = collection_name
-        self._collection: Optional[Any] = None
-        self._reranker: Any = None
+        self._conn = sqlite_conn
+        self._embed_fn = embed_fn
+        self._user_id = user_id
+        self._embedding_dim = embedding_dim
         self.chunk_size_chars = chunk_size_chars
         self.chunk_overlap_chars = chunk_overlap_chars
         self.search_max_distance = search_max_distance
 
-    # ── Lifecycle ───────────────────────────────────────────────
-
-    def _ensure_collection(self):
-        if self._collection is not None:
-            return
-        try:
-            import chromadb
-        except ImportError:
-            raise ImportError(
-                "chromadb no esta instalado. Ejecuta: pip install chromadb"
-            )
-        client = chromadb.PersistentClient(path=self._persist_dir)
-        self._collection = client.get_or_create_collection(
-            name=self._collection_name,
-            metadata={"hnsw:space": "cosine"},
-        )
-
-    @property
-    def collection(self):
-        self._ensure_collection()
-        return self._collection
-
     @property
     def conn(self):
         if self._conn is None:
-            raise RuntimeError("BookMemory requiere sqlite_conn")
+            raise RuntimeError("BookMemory requiere sqlite_conn para esta operacion")
         return self._conn
 
     def close(self):
-        self._collection = None
+        if self._conn:
+            self._conn.close()
+            self._conn = None
 
     # ── Has books / Should search ───────────────────────────────
 
     def has_books(self) -> bool:
-        return db.has_books(self.conn)
+        if self._conn is None:
+            return False
+        return db.has_books(self.conn, user_id=self._user_id)
 
     @staticmethod
     def should_search(query: str) -> bool:
@@ -548,11 +711,20 @@ class BookMemory:
 
     # ── Ingest ──────────────────────────────────────────────────
 
+    def _embed(self, text: str) -> Optional[bytes]:
+        if self._embed_fn is None:
+            return None
+        vector = self._embed_fn(text)
+        if not vector:
+            return None
+        return _embedding_to_blob(vector)
+
     def ingest(
         self,
         path: str,
         title: str = "",
         author: str = "",
+        language: str = "es",
         force: bool = False,
         pdf_layout: str = "auto",
         save_extracted_to: Optional[str] = None,
@@ -561,15 +733,7 @@ class BookMemory:
         if not path_obj.exists():
             raise FileNotFoundError(f"Archivo no encontrado: {path}")
 
-        source_hash = _hash_file(path)
-        existing = self.get_book_by_hash(source_hash)
-        if existing and not force:
-            log.info("Libro ya indexado: %s (%s)", existing["title"], existing["id"])
-            return existing["id"]
-        if existing and force:
-            log.info("Reindexando libro: %s", existing["id"])
-            self._delete_from_chroma(existing["id"])
-            db.delete_book(self.conn, existing["id"])
+        source_file_hash = _hash_file(path)
 
         ext = path_obj.suffix.lower()
         if ext == ".txt":
@@ -590,6 +754,15 @@ class BookMemory:
             raise ValueError(f"Formato no soportado: {ext}")
 
         text = clean_extracted_text(text)
+        source_text_hash = _hash_text(text)
+
+        existing = self.get_book_by_hashes(source_file_hash, source_text_hash)
+        if existing and not force:
+            log.info("Libro ya indexado: %s (%s)", existing["title"], existing["id"])
+            return existing["id"]
+        if existing and force:
+            log.info("Reindexando libro: %s", existing["id"])
+            db.delete_book(self.conn, existing["id"])
 
         if save_extracted_to:
             out = Path(save_extracted_to)
@@ -597,38 +770,23 @@ class BookMemory:
             out.write_text(text, encoding="utf-8")
             log.info("Texto extraido guardado en: %s", out)
 
+        source_type = ext.lstrip(".") if ext else ""
         book_id = _generate_book_id()
         db.insert_book(
-            self.conn, book_id, str(path_obj), source_hash,
+            self.conn, book_id, str(path_obj), source_file_hash,
+            user_id=self._user_id,
+            source_text_hash=source_text_hash,
+            source_type=source_type,
+            source_layout=pdf_layout if source_type == "pdf" else "",
+            source_text_path=save_extracted_to or "",
+            language=language,
             title=title or path_obj.stem, author=author,
             status="extracting", total_pages=total_pages,
         )
 
         try:
             db.update_book(self.conn, book_id, status="chunking")
-            raw_chunks = chunk_text(
-                text,
-                chunk_size_chars=self.chunk_size_chars,
-                chunk_overlap_chars=self.chunk_overlap_chars,
-            )
-            if not raw_chunks:
-                raise RuntimeError("No se generaron chunks del libro")
-
-            db.update_book(self.conn, book_id, status="embedding")
-            for i, c in enumerate(raw_chunks):
-                chunk_id = _make_chunk_id(book_id, i)
-                chunk_hash = _hash_text(c["text"])
-                db.insert_book_chunk(
-                    self.conn, chunk_id, book_id, i, c["text"], chunk_hash,
-                    chapter=c["chapter"],
-                    page_start=c["page_start"],
-                    page_end=c["page_end"],
-                )
-
-            db.update_book(self.conn, book_id, status="embedding",
-                           total_chunks=len(raw_chunks))
-            self._index_chunks(book_id, raw_chunks)
-
+            self._index_book(book_id, text)
             db.update_book(self.conn, book_id, status="indexed")
         except Exception as e:
             db.update_book(self.conn, book_id, status="error",
@@ -642,49 +800,31 @@ class BookMemory:
         text: str,
         title: str = "",
         author: str = "",
+        language: str = "es",
         force: bool = False,
     ) -> str:
-        source_hash = _hash_text(text)
-        existing = self.get_book_by_hash(source_hash)
+        text = clean_extracted_text(text)
+        source_text_hash = _hash_text(text)
+
+        existing = self.get_book_by_hashes("", source_text_hash)
         if existing and not force:
             return existing["id"]
         if existing and force:
-            self._delete_from_chroma(existing["id"])
             db.delete_book(self.conn, existing["id"])
-
-        text = clean_extracted_text(text)
 
         book_id = _generate_book_id()
         db.insert_book(
-            self.conn, book_id, "", source_hash,
+            self.conn, book_id, "", "",
+            user_id=self._user_id,
+            source_text_hash=source_text_hash,
+            source_type="text",
+            language=language,
             title=title or "Untitled", author=author,
             status="chunking", total_pages=1,
         )
 
         try:
-            raw_chunks = chunk_text(
-                text,
-                chunk_size_chars=self.chunk_size_chars,
-                chunk_overlap_chars=self.chunk_overlap_chars,
-            )
-            if not raw_chunks:
-                raise RuntimeError("No se generaron chunks del libro")
-
-            db.update_book(self.conn, book_id, status="embedding")
-            for i, c in enumerate(raw_chunks):
-                chunk_id = _make_chunk_id(book_id, i)
-                chunk_hash = _hash_text(c["text"])
-                db.insert_book_chunk(
-                    self.conn, chunk_id, book_id, i, c["text"], chunk_hash,
-                    chapter=c["chapter"],
-                    page_start=c["page_start"],
-                    page_end=c["page_end"],
-                )
-
-            db.update_book(self.conn, book_id, status="embedding",
-                           total_chunks=len(raw_chunks))
-            self._index_chunks(book_id, raw_chunks)
-
+            self._index_book(book_id, text)
             db.update_book(self.conn, book_id, status="indexed")
         except Exception as e:
             db.update_book(self.conn, book_id, status="error",
@@ -693,60 +833,137 @@ class BookMemory:
 
         return book_id
 
-    # ── Internal ChromaDB + FTS5 helpers ────────────────────────
+    def extract_and_ingest(
+        self,
+        path: str,
+        cache_dir: str = "./extracted",
+        title: str = "",
+        author: str = "",
+        language: str = "es",
+        force_extract: bool = False,
+        force_ingest: bool = False,
+        pdf_layout: str = "auto",
+        ingest: bool = True,
+    ) -> str:
+        path_obj = Path(path)
+        if not path_obj.exists():
+            raise FileNotFoundError(f"Archivo no encontrado: {path}")
 
-    def _index_chunks(self, book_id: str, raw_chunks: list[dict]) -> None:
-        coll = self.collection
-        ids = []
-        documents = []
-        metadatas = []
+        cache_path = Path(cache_dir) / path_obj.with_suffix(".txt").name
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-        book = db.get_book(self.conn, book_id)
-        book_title = book["title"] if book else ""
+        if force_extract or not cache_path.exists():
+            self.extract_to_txt(str(path_obj), str(cache_path), pdf_layout=pdf_layout)
+            log.info("Texto extraido a cache: %s", cache_path)
+        else:
+            log.info("Cache TXT existe: %s", cache_path)
 
-        for i, c in enumerate(raw_chunks):
-            chunk_id = _make_chunk_id(book_id, i)
-            ids.append(chunk_id)
-            documents.append(c["text"])
-            metadatas.append({
-                "book_id": book_id,
-                "book_title": book_title,
-                "chunk_index": i,
-                "chunk_id": chunk_id,
-                "language": "es",
-            })
-            db.insert_book_chunk_fts(self.conn, chunk_id, book_id, c["text"], c.get("chapter", ""))
+        if not ingest:
+            return str(cache_path)
 
-        coll.upsert(ids=ids, documents=documents, metadatas=metadatas)
+        return self.ingest(
+            str(cache_path),
+            title=title or path_obj.stem,
+            author=author,
+            language=language,
+            force=force_ingest,
+        )
 
-    def _delete_from_chroma(self, book_id: str) -> None:
-        coll = self.collection
-        results = coll.get(where={"book_id": {"$eq": book_id}})
-        if results["ids"]:
-            coll.delete(ids=results["ids"])
+    # ── Internal indexing ───────────────────────────────────────
 
-    # ── Reranker ────────────────────────────────────────────────
+    def _index_book(self, book_id: str, text: str) -> None:
+        chapters = detect_chapters(text)
 
-    def load_reranker(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2") -> None:
-        try:
-            from sentence_transformers import CrossEncoder
-            self._reranker = CrossEncoder(model_name)
-            log.info("Reranker cargado: %s", model_name)
-        except ImportError:
-            raise ImportError(
-                "sentence-transformers no instalado. Ejecuta: pip install sentence-transformers"
+        total_chunks = 0
+        for ch_index, (start, end, chapter_name) in enumerate(chapters):
+            chapter_text = text[start:end]
+            parent_chunk_id = _make_parent_chunk_id(book_id, ch_index)
+
+            parent_hash = _hash_text(chapter_text)
+            first_page = 1
+            last_page = 1
+            page_match = list(re.finditer(r"\[PAGE (\d+)\]", chapter_text))
+            if page_match:
+                first_page = int(page_match[0].group(1))
+                last_page = int(page_match[-1].group(1))
+
+            db.insert_book_chunk(
+                self.conn, parent_chunk_id, book_id,
+                level="chapter", chapter_index=ch_index, section_index=-1,
+                chunk_text=chapter_text, chunk_hash=parent_hash,
+                chapter=chapter_name,
+                page_start=first_page, page_end=last_page,
+                embedding=None,
             )
 
-    def _rerank(self, query: str, chunks: list[BookChunk], top_n: int = 5) -> list[BookChunk]:
-        if self._reranker is None or not chunks:
-            return chunks[:top_n]
+            child_sections = chunk_text(
+                chapter_text,
+                chunk_size_chars=self.chunk_size_chars,
+                chunk_overlap_chars=self.chunk_overlap_chars,
+            )
 
-        pairs = [(query, c.text) for c in chunks]
-        scores = self._reranker.predict(pairs)
-        ranked = sorted(zip(chunks, scores), key=lambda x: float(x[1]), reverse=True)
-        return [c for c, _ in ranked][:top_n]
+            for sec_index, section in enumerate(child_sections):
+                child_chunk_id = _make_child_chunk_id(book_id, ch_index, sec_index)
+                child_hash = _hash_text(section["text"])
+
+                if db.chunk_exists_by_hash(self.conn, book_id, child_hash):
+                    continue
+
+                embedding_blob = self._embed(section["text"])
+
+                db.insert_book_chunk(
+                    self.conn, child_chunk_id, book_id,
+                    level="section", chapter_index=ch_index, section_index=sec_index,
+                    chunk_text=section["text"], chunk_hash=child_hash,
+                    parent_chunk_id=parent_chunk_id,
+                    chapter=chapter_name,
+                    page_start=section["page_start"],
+                    page_end=section["page_end"],
+                    embedding=embedding_blob,
+                )
+                total_chunks += 1
+
+        db.update_book(self.conn, book_id, status="embedding",
+                       total_chapters=len(chapters),
+                       total_chunks=total_chunks)
 
     # ── Search ──────────────────────────────────────────────────
+
+    def _load_section_embeddings(self, book_id: str) -> tuple[list[dict], np.ndarray]:
+        rows = self.conn.execute("""
+            SELECT chunk_id, parent_chunk_id, chapter, chapter_index,
+                   chunk_text, page_start, page_end, embedding, char_count
+            FROM book_chunks
+            WHERE book_id=? AND level='section' AND embedding IS NOT NULL
+            ORDER BY chapter_index, section_index
+        """, (book_id,)).fetchall()
+
+        if not rows:
+            return [], np.array([])
+
+        vectors = []
+        infos = []
+        for r in rows:
+            blob = r["embedding"]
+            if blob is None:
+                continue
+            vec = _blob_to_embedding(blob)
+            vectors.append(vec)
+            infos.append({
+                "chunk_id": r["chunk_id"],
+                "parent_chunk_id": r["parent_chunk_id"],
+                "chapter": r["chapter"],
+                "chapter_index": r["chapter_index"],
+                "chunk_text": r["chunk_text"],
+                "page_start": r["page_start"],
+                "page_end": r["page_end"],
+                "char_count": r["char_count"],
+            })
+
+        if not vectors:
+            return [], np.array([])
+
+        return infos, np.array(vectors)
 
     def search(
         self,
@@ -754,108 +971,91 @@ class BookMemory:
         n_results: int = 5,
         book_id: Optional[str] = None,
         max_distance: Optional[float] = None,
-        rerank: bool = False,
     ) -> list[BookChunk]:
-        coll = self.collection
-        where: dict = {}
-        if book_id:
-            where["book_id"] = {"$eq": book_id}
-
-        results = coll.query(
-            query_texts=[query],
-            n_results=n_results,
-            where=where if where else None,
-        )
-
-        if not results["ids"] or not results["ids"][0]:
+        if not book_id:
             return []
 
-        chunks: list[BookChunk] = []
+        query_vector = self._embed(query)
+        if query_vector is None:
+            return []
+
+        query_vec = _blob_to_embedding(query_vector)
+
+        infos, vectors = self._load_section_embeddings(book_id)
+        if not infos:
+            return []
+
+        similarities = np.array([
+            _cosine_similarity(query_vec, v) for v in vectors
+        ])
+
         threshold = max_distance if max_distance is not None else self.search_max_distance
+        valid_idx = np.where(similarities >= threshold)[0]
 
-        for i, chroma_id in enumerate(results["ids"][0]):
-            distance = results["distances"][0][i] if results["distances"] else 0.0
-            if distance > threshold:
-                continue
-
-            row = db.get_book_chunk_by_chunk_id(self.conn, chroma_id)
-            if row is None:
-                continue
-
-            book_row = db.get_book(self.conn, row["book_id"])
-            book_title = book_row["title"] if book_row else ""
-
-            chunks.append(BookChunk(
-                chunk_id=chroma_id,
-                book_id=row["book_id"],
-                book_title=book_title,
-                chapter=row["chapter"],
-                page_start=row["page_start"],
-                page_end=row["page_end"],
-                chunk_index=row["chunk_index"],
-                text=row["chunk_text"],
-                char_count=row["char_count"],
-                distance=distance,
-            ))
-
-        if rerank and chunks:
-            chunks = self._rerank(query, chunks, top_n=n_results)
-
-        return chunks
-
-    def search_keyword(self, query: str, n_results: int = 5,
-                       book_id: Optional[str] = None) -> list[BookChunk]:
-        rows = db.search_book_chunks_fts(self.conn, query, n_results, book_id)
-        if not rows:
+        if len(valid_idx) == 0:
             return []
+
+        top_k = min(n_results, len(valid_idx))
+        top_indices = valid_idx[np.argsort(-similarities[valid_idx])[:top_k]]
 
         results: list[BookChunk] = []
-        for r in rows:
-            book_row = db.get_book(self.conn, r["book_id"])
+        for idx in top_indices:
+            info = infos[idx]
             results.append(BookChunk(
-                chunk_id=r["chunk_id"],
-                book_id=r["book_id"],
-                book_title=book_row["title"] if book_row else "",
-                chapter=r["chapter"],
-                page_start=r["page_start"],
-                page_end=r["page_end"],
-                chunk_index=r["chunk_index"],
-                text=r["chunk_text"],
-                char_count=r["char_count"],
-                distance=0.0,
+                chunk_id=info["chunk_id"],
+                book_id=book_id,
+                parent_chunk_id=info["parent_chunk_id"],
+                level="section",
+                chapter=info["chapter"],
+                chapter_index=info["chapter_index"],
+                page_start=info["page_start"],
+                page_end=info["page_end"],
+                text=info["chunk_text"],
+                char_count=info["char_count"],
+                distance=1.0 - similarities[idx],
             ))
+
         return results
 
-    def search_hybrid(self, query: str, n_results: int = 5,
-                      book_id: Optional[str] = None,
-                      sem_weight: float = 0.5) -> list[BookChunk]:
-        sem_weight = max(0.0, min(1.0, sem_weight))
-        sem_results = self.search(query, n_results=n_results * 2, book_id=book_id)
-        kw_results = self.search_keyword(query, n_results=n_results * 2, book_id=book_id)
-
-        scores: dict[str, tuple[BookChunk, float]] = {}
-
-        for rank, c in enumerate(sem_results):
-            score = sem_weight * (1.0 / (rank + 1))
-            prev = scores.get(c.chunk_id, (c, 0.0))[1]
-            scores[c.chunk_id] = (c, prev + score)
-
-        for rank, c in enumerate(kw_results):
-            score = (1.0 - sem_weight) * (1.0 / (rank + 1))
-            prev = scores.get(c.chunk_id, (c, 0.0))[1]
-            scores[c.chunk_id] = (c, prev + score)
-
-        ranked = sorted(scores.values(), key=lambda x: x[1], reverse=True)
-        return [chunk for chunk, _ in ranked[:n_results]]
-
     # ── Build context ───────────────────────────────────────────
+
+    def truncate_centered(self, parent: dict, child_rows: list[dict], max_chars: int) -> str:
+        parent_text = parent["chunk_text"]
+        if len(parent_text) <= max_chars:
+            return parent_text
+
+        best_child = next(
+            (r for r in child_rows if r["parent_chunk_id"] == parent["chunk_id"]),
+            None,
+        )
+        if not best_child:
+            return parent_text[:max_chars]
+
+        child_start = parent_text.find(best_child["chunk_text"][:100])
+        if child_start == -1:
+            return parent_text[:max_chars]
+
+        half = max_chars // 2
+        start = max(0, child_start - half)
+        end = min(len(parent_text), child_start + half)
+
+        if start > 0:
+            s = parent_text.find(" ", start - 20)
+            start = s + 1 if s != -1 else start
+        if end < len(parent_text):
+            e = parent_text.rfind(" ", 0, end)
+            end = e if e != -1 else end
+
+        prefix = "[...]" if start > 0 else ""
+        suffix = "[...]" if end < len(parent_text) else ""
+        return f"{prefix}{parent_text[start:end]}{suffix}"
 
     def build_context(
         self,
         query: str,
-        n_results: int = 5,
+        n_results: int = 3,
         book_id: Optional[str] = None,
-        max_chars: int = 5000,
+        max_chars: int = 3000,
         max_distance: Optional[float] = None,
     ) -> str:
         chunks = self.search(
@@ -865,40 +1065,126 @@ class BookMemory:
         if not chunks:
             return ""
 
-        lines = ["[BOOK_CONTEXT]"]
-        total_chars = 0
-        added = False
+        parent_ids = list(set(c.parent_chunk_id for c in chunks if c.parent_chunk_id))
+        if not parent_ids:
+            return ""
 
-        for c in chunks:
-            header = f"Fuente: {c.book_title}"
-            if c.chapter:
-                header += f" ({c.chapter}"
-                if c.page_start:
-                    header += f", pagina {c.page_start}"
-                header += ")"
-            entry = f"{header}:\n  {c.text.strip()}"
-            if total_chars + len(entry) > max_chars:
-                if not added:
-                    entry = entry[:max_chars].rstrip() + "..."
-                else:
-                    break
-            lines.append("")
-            lines.append(entry)
-            total_chars += len(entry)
-            added = True
+        placeholders = ",".join("?" * len(parent_ids))
+        parents = self.conn.execute(f"""
+            SELECT chunk_id, chapter, chunk_text, char_count
+            FROM book_chunks WHERE chunk_id IN ({placeholders})
+        """, parent_ids).fetchall()
 
-        return "\n".join(lines) if added else ""
+        child_dict = [
+            {"parent_chunk_id": c.parent_chunk_id, "chunk_text": c.text}
+            for c in chunks
+        ]
+
+        context_parts = []
+        for p in parents:
+            parent_dict = dict(p)
+            p_max = max_chars // len(parents)
+            truncated = self.truncate_centered(parent_dict, child_dict, p_max)
+            context_parts.append(f"## {parent_dict['chapter']}\n{truncated}")
+
+        context = "\n\n".join(context_parts)
+        return f"[BOOK_CONTEXT]\n{context}\n[/BOOK_CONTEXT]"
+
+    # ── Chapter reading ─────────────────────────────────────────
+
+    def list_chapters(self, book_id: str) -> list[ChapterInfo]:
+        rows = db.list_chapters(self.conn, book_id)
+        return [
+            ChapterInfo(
+                chapter_index=r["chapter_index"],
+                chapter=r["chapter"],
+                page_start=r["page_start"],
+                page_end=r["page_end"],
+                char_count=r["char_count"],
+                chunk_id=r["chunk_id"],
+            )
+            for r in rows
+        ]
+
+    def get_chapter(self, book_id: str, chapter_index: int) -> Optional[dict]:
+        row = self.conn.execute("""
+            SELECT chunk_id, chapter, chunk_text, page_start, page_end, char_count
+            FROM book_chunks
+            WHERE book_id=? AND chapter_index=? AND level='chapter'
+        """, (book_id, chapter_index)).fetchone()
+        return dict(row) if row else None
+
+    def build_chapter_context(self, book_id: str, chapter_index: int, max_chars: int) -> str:
+        chapter = self.get_chapter(book_id, chapter_index)
+        if not chapter:
+            return ""
+
+        text = chapter["chunk_text"]
+        if len(text) <= max_chars:
+            return f"[BOOK_CONTEXT]\n## {chapter['chapter']}\n{text}\n[/BOOK_CONTEXT]"
+
+        truncated = text[:max_chars]
+        truncated = truncated[:truncated.rfind(" ")]
+        return f"[BOOK_CONTEXT]\n## {chapter['chapter']}\n{truncated}[...]\n[/BOOK_CONTEXT]"
+
+    # ── Multilanguage handling ──────────────────────────────────
+
+    def _get_book_language(self, book_id: Optional[str]) -> str:
+        if not book_id:
+            return "en"
+        book = db.get_book(self.conn, book_id)
+        return book["language"] if book else "en"
+
+    def handle_language_mismatch(self, query: str, book_language: str,
+                                  llm=None, strategy: str = "passthrough") -> str:
+        if strategy == "passthrough" or not llm:
+            return query
+
+        try:
+            from lingua import LanguageDetectorBuilder
+            detector = LanguageDetectorBuilder.from_all_languages().build()
+            query_lang = detector.detect_language_of(query[:3000])
+            ql = query_lang.iso_code_639_1.name.lower() if query_lang else "en"
+        except Exception:
+            ql = "es"
+
+        if book_language == ql:
+            return query
+
+        if strategy == "translate":
+            prompt = f"Translate to {book_language}, output only the translation:\n{query}"
+            try:
+                res = llm.complete(prompt, max_tokens=200)
+                return res.strip()
+            except Exception:
+                return query
+
+        if strategy == "expand":
+            prompt = f"""From: "{query}"
+Extract 3-5 key concepts and translate them to {book_language}.
+Output only the keywords separated by spaces."""
+            try:
+                keywords = llm.complete(prompt, max_tokens=50).strip()
+                return f"{query} {keywords}"
+            except Exception:
+                return query
+
+        return query
 
     # ── CRUD ────────────────────────────────────────────────────
 
     def get_book(self, book_id: str) -> Optional[dict]:
         return db.get_book(self.conn, book_id)
 
-    def get_book_by_hash(self, source_hash: str) -> Optional[dict]:
-        return db.get_book_by_hash(self.conn, source_hash)
+    def get_book_by_hashes(self, source_file_hash: str,
+                           source_text_hash: str) -> Optional[dict]:
+        return db.get_book_by_hashes(self.conn, source_file_hash, source_text_hash)
+
+    def get_book_by_file_hash(self, source_file_hash: str) -> Optional[dict]:
+        return db.get_book_by_file_hash(self.conn, source_file_hash)
 
     def list_books(self) -> list[dict]:
-        return db.list_books(self.conn)
+        return db.list_books(self.conn, user_id=self._user_id)
 
     def get_chunks(self, book_id: str, limit: int = 50) -> list[BookChunk]:
         rows = db.get_book_chunks(self.conn, book_id, limit=limit)
@@ -906,18 +1192,20 @@ class BookMemory:
             BookChunk(
                 chunk_id=r["chunk_id"],
                 book_id=r["book_id"],
-                chapter=r["chapter"],
-                page_start=r["page_start"],
-                page_end=r["page_end"],
-                chunk_index=r["chunk_index"],
+                parent_chunk_id=r.get("parent_chunk_id"),
+                level=r.get("level", "section"),
+                chapter=r.get("chapter", ""),
+                chapter_index=r.get("chapter_index", 0),
+                section_index=r.get("section_index", 0),
+                page_start=r.get("page_start", 0),
+                page_end=r.get("page_end", 0),
                 text=r["chunk_text"],
-                char_count=r["char_count"],
+                char_count=r.get("char_count", 0),
             )
             for r in rows
         ]
 
     def delete_book(self, book_id: str) -> None:
-        self._delete_from_chroma(book_id)
         db.delete_book(self.conn, book_id)
         log.info("Libro eliminado: %s", book_id)
 
@@ -926,18 +1214,18 @@ class BookMemory:
         if not book:
             raise ValueError(f"Libro no encontrado: {book_id}")
 
-        self._delete_from_chroma(book_id)
-        rows = db.get_book_chunks(self.conn, book_id)
-        if not rows:
-            raise RuntimeError(f"El libro {book_id} no tiene chunks para reindexar")
-        raw_chunks = [
-            {"text": r["chunk_text"], "chapter": r["chapter"],
-             "page_start": r["page_start"], "page_end": r["page_end"]}
-            for r in rows
-        ]
-        self._index_chunks(book_id, raw_chunks)
-        db.update_book(self.conn, book_id, status="indexed")
-        log.info("Libro reindexado: %s", book_id)
+        if book.get("source_path") and Path(book["source_path"]).exists():
+            self.ingest(
+                book["source_path"],
+                title=book["title"],
+                author=book["author"],
+                language=book["language"],
+                force=True,
+            )
+        else:
+            raise RuntimeError(
+                f"No se puede reindexar {book_id}: source_path no disponible"
+            )
 
     def validate_index(self, book_id: str) -> dict:
         book = db.get_book(self.conn, book_id)
@@ -945,27 +1233,32 @@ class BookMemory:
             return {"exists": False, "error": "Libro no encontrado"}
 
         sql_chunks = db.count_book_chunks(self.conn, book_id)
+        sql_sections = self.conn.execute(
+            "SELECT COUNT(*) FROM book_chunks WHERE book_id=? AND level='section'",
+            (book_id,),
+        ).fetchone()[0]
 
-        coll = self.collection
-        chroma_results = coll.get(where={"book_id": {"$eq": book_id}})
-        chroma_count = len(chroma_results["ids"]) if chroma_results["ids"] else 0
+        chunk_ids = set()
+        for r in self.conn.execute(
+            "SELECT chunk_id FROM book_chunks WHERE book_id=? AND level='section'",
+            (book_id,),
+        ).fetchall():
+            chunk_ids.add(r[0])
 
         return {
             "exists": True,
             "book_id": book_id,
             "title": book["title"],
             "status": book["status"],
-            "sql_chunks": sql_chunks,
-            "chroma_chunks": chroma_count,
-            "match": sql_chunks == chroma_count,
-            "sql_chunk_ids": {r["chunk_id"] for r in db.get_book_chunks(self.conn, book_id)},
-            "chroma_chunk_ids": set(chroma_results["ids"]) if chroma_results["ids"] else set(),
+            "total_chunks": sql_chunks,
+            "section_chunks": sql_sections,
+            "chunk_ids_sorted": sorted(chunk_ids),
         }
 
     def get_stats(self) -> dict:
-        total_books = db.count_books(self.conn)
+        total_books = db.count_books(self.conn, user_id=self._user_id)
         total_chunks = 0
-        books = db.list_books(self.conn)
+        books = db.list_books(self.conn, user_id=self._user_id)
         for b in books:
             total_chunks += db.count_book_chunks(self.conn, b["id"])
         return {

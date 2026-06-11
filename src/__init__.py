@@ -3,7 +3,7 @@ from __future__ import annotations
 # pyrefly: ignore [missing-import]
 from .book_memory import BookMemory, should_search_books
 # pyrefly: ignore [missing-import]
-from .book_models import BookChunk, BookInfo
+from .book_models import BookChunk, BookInfo, ChapterInfo
 # pyrefly: ignore [missing-import]
 from .conversation_summary import ConversationSummaryMemory
 # pyrefly: ignore [missing-import]

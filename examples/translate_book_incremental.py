@@ -31,6 +31,39 @@ _PAGE_RE = re.compile(r"\[PAGE (\d+)\]")
 _CHAPTER_RE = re.compile(r"#CHAPTER#\s*(.+)", re.IGNORECASE)
 _SECTION_RE = re.compile(r"#SECTION#\s*(.+)", re.IGNORECASE)
 
+_LLM_PREFIXES = [
+    "Aquí tienes la traducción:", "Aqui tienes la traduccion:",
+    "Texto procesado:", "Traducción:", "Traduccion:",
+    "Aquí está:", "Aquí esta:",
+]
+
+
+def clean_llm_output(output: str) -> str:
+    output = output.strip()
+    for p in _LLM_PREFIXES:
+        if output.lower().startswith(p.lower()):
+            output = output[len(p):].strip()
+    if output.startswith("```"):
+        output = re.sub(r"^```(?:text|markdown)?\s*", "", output, flags=re.I)
+        output = re.sub(r"\s*```$", "", output)
+    return output.strip()
+
+
+def validate_processed_text(original: str, output: str,
+                            strict_pages: bool = True) -> bool:
+    if not output.strip():
+        return False
+    if len(output) < len(original) * 0.35:
+        return False
+    if len(output) > len(original) * 2.5:
+        return False
+    if strict_pages:
+        original_pages = set(_PAGE_RE.findall(original))
+        output_pages = set(_PAGE_RE.findall(output))
+        if original_pages and not original_pages.issubset(output_pages):
+            return False
+    return True
+
 
 def _pick_model(llm) -> str:
     models = llm.list_models()
@@ -203,6 +236,8 @@ Bloque:
         )
         output = res.content.strip() if res and res.content else block["text"]
 
+        output = clean_llm_output(output)
+
         ch = _CHAPTER_RE.findall(output)
         if ch:
             chapter = ch[-1].strip()
@@ -210,8 +245,8 @@ Bloque:
         if sec:
             section = sec[-1].strip()
 
-        if len(output) < len(block["text"]) * 0.40:
-            print(f" muy corto, usando original")
+        if not validate_processed_text(block["text"], output):
+            print(f" validacion fallo, usando original")
             output = block["text"]
         else:
             print(" OK")
@@ -275,6 +310,8 @@ def translate_page(llm, marker: str, content: str, previous_page: str,
         )
         output = res.content.strip() if res and res.content else f"{marker}\n{content}"
 
+        output = clean_llm_output(output)
+
         ch = _CHAPTER_RE.findall(output)
         if ch:
             chapter = ch[-1].strip()
@@ -282,9 +319,10 @@ def translate_page(llm, marker: str, content: str, previous_page: str,
         if sec:
             section = sec[-1].strip()
 
-        if len(output) < len(content) * 0.40:
-            print(f" muy corto, usando original")
-            output = f"{marker}\n{content}"
+        original_text = f"{marker}\n{content}"
+        if not validate_processed_text(original_text, output):
+            print(f" validacion fallo, usando original")
+            output = original_text
         else:
             print(" OK")
         return output, chapter, section
@@ -507,8 +545,8 @@ def main():
     parser.add_argument("--config")
     parser.add_argument("--n-ctx", type=int, default=8192)
     parser.add_argument("--chunk-size", type=int, default=8000)
-    parser.add_argument("--translate", action="store_true", default=True,
-                        help="Traducir el texto (default: True)")
+    parser.add_argument("--no-translate", action="store_true",
+                        help="No traducir; solo optimizar")
     parser.add_argument("--optimize", action="store_true",
                         help="Agregar marcadores #CHAPTER#/#SECTION#")
     parser.add_argument("--by-page", action="store_true",
@@ -535,7 +573,7 @@ def main():
         skip_extract = args.skip_extract
         layout = args.layout
         lang = args.lang
-        translate = args.translate
+        translate = not args.no_translate
         optimize = args.optimize
         by_page = args.by_page
         chunk_size = args.chunk_size
@@ -606,19 +644,33 @@ def main():
         print(f"\n{'='*50}")
         print(f"  PASO 2: Traducir a {lang}")
         print(f"{'='*50}")
-        suffix = ".optimized.txt" if optimize else ".txt"
-        out_path = _EXTRACTED_DIR / f"{src.stem}.{lang}{suffix}"
-        state_path = _EXTRACTED_DIR / f"{src.stem}.{lang}.state.json"
+
+        optimized_text = opt_path.read_text(encoding="utf-8")
+        optimized_pages = split_by_pages(optimized_text)
+
+        if by_page:
+            pass2_units = [{"marker": m, "content": c} for m, c in optimized_pages]
+            pass2_type = "paginas"
+        else:
+            raw_blocks = build_page_blocks(optimized_pages, max_chars=chunk_size)
+            pass2_units = [{"marker": b["start_page"], "content": b["text"]} for b in raw_blocks]
+            pass2_type = "bloques"
+
+        pass2_total = len(pass2_units)
+
+        suffix = f".{lang}.optimized.txt"
+        out_path = _EXTRACTED_DIR / f"{src.stem}.{lang}.optimized.txt"
+        state_path = _EXTRACTED_DIR / f"{src.stem}.{lang}.optimized.state.json"
         state = load_state(state_path)
         start_from = state.get("last_completed_block", 0) if resume else 0
         if start_from > 0:
-            print(f"Reanudando desde {unit_type} {start_from}/{total_units}")
+            print(f"Reanudando desde {pass2_type} {start_from}/{pass2_total}")
 
         _process_units(
-            llm, units, by_page, unit_type, lang,
+            llm, pass2_units, by_page, pass2_type, lang,
             translate=True, optimize=False,
             out_path=out_path, state_path=state_path,
-            start_from=start_from, total_units=total_units,
+            start_from=start_from, total_units=pass2_total,
         )
 
         # Verificar si el paso 2 completo
@@ -658,7 +710,7 @@ def main():
     )
 
     completed = completed_units >= total_units
-    out_size = out_path.stat().size if out_path.exists() else 0
+    out_size = out_path.stat().st_size if out_path.exists() else 0
     print(f"\n--- {'Completado' if completed else 'Incompleto'} ---")
     print(f"Original:  {txt_path}")
     print(f"Procesado: {out_path} ({out_size} bytes)")

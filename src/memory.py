@@ -82,10 +82,6 @@ class MemoryManager:
         self._conn.execute("DELETE FROM semantic_memories")
         self._conn.execute("DELETE FROM book_chunks")
         self._conn.execute("DELETE FROM books")
-        try:
-            self._conn.execute("DELETE FROM book_chunks_fts")
-        except Exception:
-            pass
         self._conn.commit()
 
     # ── Messages ───────────────────────────────────────────────
