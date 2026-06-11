@@ -27,7 +27,7 @@ _BOOK_TRIGGERS = [
 ]
 
 _CHAPTER_PATTERNS = [
-    re.compile(r"^(?:Cap[ií]tulo|Chapter|Section|Tema)\s+\d+[:\.\s]", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^(?:Cap[ií]tulo|Chapter|Ch\.|Section|Tema)\s+\d+[:\.\s]", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^(?:\d+\.\d+\s+.+)", re.MULTILINE),
     re.compile(r"^(?:#{1,3}\s+.+)", re.MULTILINE),
     re.compile(r"^[A-Z\s]{10,}$", re.MULTILINE),
@@ -930,6 +930,22 @@ class BookMemory:
         db.update_book(self.conn, book_id, status="embedding",
                        total_chapters=len(chapters),
                        total_chunks=total_chunks)
+        for ch_index, (_, _, chapter_name) in enumerate(chapters):
+            parent_id = _make_parent_chunk_id(book_id, ch_index)
+            row = self.conn.execute(
+                "SELECT page_start, page_end, char_count FROM book_chunks WHERE chunk_id=?", (parent_id,)
+            ).fetchone()
+            section_count = self.conn.execute(
+                "SELECT COUNT(*) FROM book_chunks WHERE book_id=? AND chapter_index=? AND level='section'",
+                (book_id, ch_index),
+            ).fetchone()[0]
+            if row:
+                db.upsert_book_chapter(
+                    self.conn, book_id, ch_index,
+                    title=chapter_name,
+                    page_start=row["page_start"], page_end=row["page_end"],
+                    char_count=row["char_count"], chunk_count=section_count,
+                )
 
     # ── Index-based indexing ─────────────────────────────────────
 
@@ -955,7 +971,7 @@ class BookMemory:
         chapters: list[tuple[str, int, list[tuple[str, int]]]] = []
         current_chapter: Optional[tuple[str, int, list[tuple[str, int]]]] = None
         for title, page in entries:
-            is_chapter = bool(re.match(r"(?:Ch\.|Chapter|Cap[ií]tulo)\s*\d+", title, re.IGNORECASE))
+            is_chapter = bool(re.match(r"(?:Ch\.|Chapter|Cap[ií]tulo|Section|Tema)\s*\d+", title, re.IGNORECASE))
             if is_chapter:
                 current_chapter = (title, page, [])
                 chapters.append(current_chapter)
@@ -1044,6 +1060,23 @@ class BookMemory:
         db.update_book(self.conn, book_id, status="embedding",
                        total_chapters=len(chapters),
                        total_chunks=total_chunks)
+        for ch_index, (ch_title, ch_page, _) in enumerate(chapters):
+            parent_id = _make_parent_chunk_id(book_id, ch_index)
+            row = self.conn.execute(
+                "SELECT page_start, page_end, char_count FROM book_chunks WHERE chunk_id=?", (parent_id,)
+            ).fetchone()
+            section_count = self.conn.execute(
+                "SELECT COUNT(*) FROM book_chunks WHERE book_id=? AND chapter_index=? AND level='section'",
+                (book_id, ch_index),
+            ).fetchone()[0]
+            next_page = chapters[ch_index + 1][1] if ch_index + 1 < len(chapters) else ch_page
+            if row:
+                db.upsert_book_chapter(
+                    self.conn, book_id, ch_index,
+                    title=ch_title,
+                    page_start=ch_page, page_end=next_page - 1,
+                    char_count=row["char_count"], chunk_count=section_count,
+                )
 
     # ── Search ──────────────────────────────────────────────────
 
@@ -1215,11 +1248,12 @@ class BookMemory:
         return [
             ChapterInfo(
                 chapter_index=r["chapter_index"],
-                chapter=r["chapter"],
+                chapter=r.get("title") or r.get("chapter", ""),
                 page_start=r["page_start"],
                 page_end=r["page_end"],
                 char_count=r["char_count"],
-                chunk_id=r["chunk_id"],
+                chunk_count=r.get("chunk_count", 0),
+                chunk_id=r.get("chunk_id", ""),
             )
             for r in rows
         ]

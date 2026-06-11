@@ -50,4 +50,5 @@ class ChapterInfo:
     page_start: int = 0
     page_end: int = 0
     char_count: int = 0
+    chunk_count: int = 0
     chunk_id: str = ""

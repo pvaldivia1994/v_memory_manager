@@ -132,7 +132,20 @@ CREATE INDEX IF NOT EXISTS idx_book_chunks_book_id ON book_chunks(book_id);
 CREATE INDEX IF NOT EXISTS idx_book_chunks_parent ON book_chunks(parent_chunk_id);
 CREATE INDEX IF NOT EXISTS idx_book_chunks_book_chapter ON book_chunks(book_id, chapter_index);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_book_chunks_book_section ON book_chunks(book_id, chapter_index, section_index);
-CREATE INDEX IF NOT EXISTS idx_book_chunks_hash ON book_chunks(chunk_hash);"""
+CREATE INDEX IF NOT EXISTS idx_book_chunks_hash ON book_chunks(chunk_hash);
+
+CREATE TABLE IF NOT EXISTS book_chapters (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id         TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    chapter_index   INTEGER NOT NULL,
+    title           TEXT NOT NULL DEFAULT '',
+    page_start      INTEGER NOT NULL DEFAULT 0,
+    page_end        INTEGER NOT NULL DEFAULT 0,
+    char_count      INTEGER NOT NULL DEFAULT 0,
+    chunk_count     INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(book_id, chapter_index)
+);"""
 
 
 
@@ -280,6 +293,21 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_book_chapter ON book_chunks(book_id, chapter_index)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_book_chunks_book_section ON book_chunks(book_id, chapter_index, section_index)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_hash ON book_chunks(chunk_hash)")
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS book_chapters (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            book_id         TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            chapter_index   INTEGER NOT NULL,
+            title           TEXT NOT NULL DEFAULT '',
+            page_start      INTEGER NOT NULL DEFAULT 0,
+            page_end        INTEGER NOT NULL DEFAULT 0,
+            char_count      INTEGER NOT NULL DEFAULT 0,
+            chunk_count     INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(book_id, chapter_index)
+        )
+    """)
 
     conn.commit()
 
@@ -667,12 +695,34 @@ def get_chapter_chunks(conn: sqlite3.Connection, book_id: str,
 
 def list_chapters(conn: sqlite3.Connection, book_id: str) -> list[dict]:
     rows = conn.execute("""
+        SELECT chapter_index, title, page_start, page_end, char_count, chunk_count
+        FROM book_chapters
+        WHERE book_id=?
+        ORDER BY chapter_index
+    """, (book_id,)).fetchall()
+    if rows:
+        return [dict(r) for r in rows]
+    rows = conn.execute("""
         SELECT chunk_id, chapter, chapter_index, page_start, page_end, char_count
         FROM book_chunks
         WHERE book_id=? AND level='chapter'
         ORDER BY chapter_index
     """, (book_id,)).fetchall()
     return [dict(r) for r in rows]
+
+
+def upsert_book_chapter(conn: sqlite3.Connection, book_id: str, chapter_index: int,
+                        title: str, page_start: int, page_end: int,
+                        char_count: int, chunk_count: int) -> None:
+    conn.execute("""
+        INSERT INTO book_chapters (book_id, chapter_index, title, page_start, page_end, char_count, chunk_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(book_id, chapter_index) DO UPDATE SET
+            title=excluded.title, page_start=excluded.page_start,
+            page_end=excluded.page_end, char_count=excluded.char_count,
+            chunk_count=excluded.chunk_count
+    """, (book_id, chapter_index, title, page_start, page_end, char_count, chunk_count))
+    conn.commit()
 
 
 def get_first_window_message_id(
