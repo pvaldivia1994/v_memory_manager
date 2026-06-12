@@ -146,6 +146,22 @@ CREATE TABLE IF NOT EXISTS book_chapters (
             created_at      TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE(book_id, chapter_index)
         );
+
+CREATE TABLE IF NOT EXISTS book_caps (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cap_id          TEXT NOT NULL UNIQUE,
+    book_id         TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+    chapter_index   INTEGER NOT NULL DEFAULT 0,
+    cap_index       INTEGER NOT NULL DEFAULT 0,
+    title           TEXT NOT NULL DEFAULT '',
+    page_start      INTEGER NOT NULL DEFAULT 0,
+    page_end        INTEGER NOT NULL DEFAULT 0,
+    content         TEXT NOT NULL DEFAULT '',
+    char_count      INTEGER NOT NULL DEFAULT 0,
+    section_count   INTEGER NOT NULL DEFAULT 0,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(book_id, chapter_index, cap_index)
+);
     """;
 
 
@@ -294,6 +310,23 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             chunk_count     INTEGER NOT NULL DEFAULT 0,
             created_at      TEXT NOT NULL DEFAULT (datetime('now')),
             UNIQUE(book_id, chapter_index)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS book_caps (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            cap_id          TEXT NOT NULL UNIQUE,
+            book_id         TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            chapter_index   INTEGER NOT NULL DEFAULT 0,
+            cap_index       INTEGER NOT NULL DEFAULT 0,
+            title           TEXT NOT NULL DEFAULT '',
+            page_start      INTEGER NOT NULL DEFAULT 0,
+            page_end        INTEGER NOT NULL DEFAULT 0,
+            content         TEXT NOT NULL DEFAULT '',
+            char_count      INTEGER NOT NULL DEFAULT 0,
+            section_count   INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(book_id, chapter_index, cap_index)
         )
     """)
     conn.commit()
@@ -710,6 +743,37 @@ def upsert_book_chapter(conn: sqlite3.Connection, book_id: str, chapter_index: i
             chunk_count=excluded.chunk_count
     """, (book_id, chapter_index, title, page_start, page_end, char_count, chunk_count))
     conn.commit()
+
+
+def upsert_book_cap(conn: sqlite3.Connection, cap_id: str, book_id: str,
+                    chapter_index: int, cap_index: int, title: str,
+                    page_start: int, page_end: int, content: str,
+                    char_count: int, section_count: int) -> None:
+    conn.execute("""
+        INSERT INTO book_caps (cap_id, book_id, chapter_index, cap_index, title,
+                               page_start, page_end, content, char_count, section_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(cap_id) DO UPDATE SET
+            title=excluded.title, page_start=excluded.page_start,
+            page_end=excluded.page_end, content=excluded.content,
+            char_count=excluded.char_count, section_count=excluded.section_count
+    """, (cap_id, book_id, chapter_index, cap_index, title,
+          page_start, page_end, content, char_count, section_count))
+    conn.commit()
+
+
+def get_caps(conn: sqlite3.Connection, book_id: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT cap_id, chapter_index, cap_index, title, page_start, page_end, char_count, section_count "
+        "FROM book_caps WHERE book_id=? ORDER BY chapter_index, cap_index",
+        (book_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_cap_by_id(conn: sqlite3.Connection, cap_id: str) -> Optional[dict]:
+    row = conn.execute("SELECT * FROM book_caps WHERE cap_id=?", (cap_id,)).fetchone()
+    return dict(row) if row else None
 
 
 def get_first_window_message_id(

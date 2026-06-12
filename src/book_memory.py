@@ -1092,6 +1092,15 @@ class BookMemory:
                     page_start=sec_start, page_end=sec_end,
                     embedding=None,
                 )
+                db.upsert_book_cap(
+                    self.conn, cap_chunk_id, book_id,
+                    chapter_index=ch_index, cap_index=cap_index,
+                    title=cap_title,
+                    page_start=sec_start, page_end=sec_end,
+                    content=cap_text_combined,
+                    char_count=len(cap_text_combined),
+                    section_count=len(cap_sections),
+                )
 
         db.update_book(self.conn, book_id, status="embedding",
                        total_chapters=len(chapters),
@@ -1317,6 +1326,9 @@ class BookMemory:
         return f"[BOOK_CONTEXT]\n## {chapter['chapter']}\n{truncated}\n[/BOOK_CONTEXT]"
 
     def list_caps(self, book_id: str) -> list[dict]:
+        rows = db.get_caps(self.conn, book_id)
+        if rows:
+            return rows
         rows = self.conn.execute("""
             SELECT chunk_id, chapter, chapter_index, section_index AS cap_index,
                    page_start, page_end, char_count
@@ -1327,6 +1339,10 @@ class BookMemory:
         return [dict(r) for r in rows]
 
     def get_cap(self, book_id: str, chapter_index: int, cap_index: int) -> Optional[dict]:
+        cap_chunk_id = _make_cap_chunk_id(book_id, chapter_index, cap_index)
+        row = db.get_cap_by_id(self.conn, cap_chunk_id)
+        if row:
+            return row
         row = self.conn.execute("""
             SELECT chunk_id, chapter, chunk_text, page_start, page_end, char_count
             FROM book_chunks
@@ -1339,12 +1355,12 @@ class BookMemory:
         cap = self.get_cap(book_id, chapter_index, cap_index)
         if not cap:
             return ""
-        text = cap["chunk_text"]
+        text = cap.get("content") or cap.get("chunk_text") or ""
+        title = cap.get("title") or cap.get("chapter") or ""
         if len(text) <= max_chars:
-            return f"[BOOK_CONTEXT]\n## {cap['chapter']}\n{text}\n[/BOOK_CONTEXT]"
+            return f"[BOOK_CONTEXT]\n## {title}\n{text}\n[/BOOK_CONTEXT]"
         truncated = text[:max_chars]
-        truncated = truncated[:truncated.rfind(" ")]
-        return f"[BOOK_CONTEXT]\n## {chapter['chapter']}\n{truncated}\n[/BOOK_CONTEXT]"
+        return f"[BOOK_CONTEXT]\n## {title}\n{truncated}\n[/BOOK_CONTEXT]"
 
     # ── Multilanguage handling ──────────────────────────────────
 
