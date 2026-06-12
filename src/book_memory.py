@@ -1234,6 +1234,10 @@ class BookMemory:
         max_chars: int = 3000,
         max_distance: Optional[float] = None,
     ) -> str:
+        if not book_id:
+            books = db.list_books(self.conn, user_id=self._user_id)
+            if books:
+                book_id = books[0]["id"]
         chunks = self.search(
             query, n_results=n_results, book_id=book_id,
             max_distance=max_distance,
@@ -1303,6 +1307,36 @@ class BookMemory:
         truncated = text[:max_chars]
         truncated = truncated[:truncated.rfind(" ")]
         return f"[BOOK_CONTEXT]\n## {chapter['chapter']}\n{truncated}[...]\n[/BOOK_CONTEXT]"
+
+    def list_caps(self, book_id: str) -> list[dict]:
+        rows = self.conn.execute("""
+            SELECT chunk_id, chapter, chapter_index, section_index AS cap_index,
+                   page_start, page_end, char_count
+            FROM book_chunks
+            WHERE book_id=? AND level='cap'
+            ORDER BY chapter_index, section_index
+        """, (book_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_cap(self, book_id: str, chapter_index: int, cap_index: int) -> Optional[dict]:
+        row = self.conn.execute("""
+            SELECT chunk_id, chapter, chunk_text, page_start, page_end, char_count
+            FROM book_chunks
+            WHERE book_id=? AND chapter_index=? AND section_index=? AND level='cap'
+        """, (book_id, chapter_index, cap_index)).fetchone()
+        return dict(row) if row else None
+
+    def build_cap_context(self, book_id: str, chapter_index: int,
+                          cap_index: int, max_chars: int) -> str:
+        cap = self.get_cap(book_id, chapter_index, cap_index)
+        if not cap:
+            return ""
+        text = cap["chunk_text"]
+        if len(text) <= max_chars:
+            return f"[BOOK_CONTEXT]\n## {cap['chapter']}\n{text}\n[/BOOK_CONTEXT]"
+        truncated = text[:max_chars]
+        truncated = truncated[:truncated.rfind(" ")]
+        return f"[BOOK_CONTEXT]\n## {cap['chapter']}\n{truncated}[...]\n[/BOOK_CONTEXT]"
 
     # ── Multilanguage handling ──────────────────────────────────
 

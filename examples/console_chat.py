@@ -430,13 +430,15 @@ def main():
                     continue
                 if len(parts) < 2:
                     print("[Uso: /book <comando>]")
-                    print("  /book list                  - Listar libros indexados")
-                    print("  /book ingest <ruta>         - Ingestar un PDF/TXT")
-                    print("  /book search <consulta>     - Buscar en libros")
-                    print("  /book chapters <book_id>    - Listar capitulos")
-                    print("  /book chapter <id> <N>      - Inyectar capitulo completo")
-                    print("  /book delete <book_id>      - Eliminar libro")
-                    print("  /book stats                 - Estadisticas")
+                    print("  /book list                    - Listar libros indexados")
+                    print("  /book ingest <ruta>           - Ingestar un PDF/TXT")
+                    print("  /book search <consulta>       - Buscar en libros")
+                    print("  /book chapters <book_id>      - Listar capitulos")
+                    print("  /book chapter <id> <N>        - Inyectar capitulo completo")
+                    print("  /book caps <book_id>          - Listar caps (indice)")
+                    print("  /book cap <id> <ch> <cap>    - Inyectar cap del indice")
+                    print("  /book delete <book_id>        - Eliminar libro")
+                    print("  /book stats                   - Estadisticas")
                     continue
                 sub = parts[1].split(maxsplit=1)
                 sub_cmd = sub[0].lower()
@@ -510,6 +512,37 @@ def main():
                         print("[Capitulo no encontrado]")
                         continue
                     print(f"\n{DIM}── Capitulo {ch_index} ──{RESET}")
+                    print(ctx)
+                    print(f"{DIM}─────────────────────────{RESET}")
+
+                elif sub_cmd == "caps":
+                    caps = book_mem.list_caps(sub_arg)
+                    if not caps:
+                        print("[No hay caps para este libro (usa --index)]")
+                        continue
+                    print(f"\n{DIM}── Caps de {sub_arg} ({len(caps)}) ──{RESET}")
+                    for c in caps:
+                        print(f"  [ch={c['chapter_index']} cap={c['cap_index']}] {c['chapter'][:50]} (p{c['page_start']}-{c['page_end']})")
+                    print(f"{DIM}──────────────────────────{RESET}")
+
+                elif sub_cmd == "cap":
+                    cap_parts = sub_arg.split(maxsplit=2)
+                    if len(cap_parts) < 3:
+                        print("[Uso: /book cap <book_id> <ch_index> <cap_index>]")
+                        print("  /book caps <book_id>  - para ver los indices")
+                        continue
+                    cap_book_id = cap_parts[0]
+                    try:
+                        cap_ch = int(cap_parts[1])
+                        cap_idx = int(cap_parts[2])
+                    except ValueError:
+                        print("[Los indices deben ser numeros]")
+                        continue
+                    ctx = book_mem.build_cap_context(cap_book_id, cap_ch, cap_idx, max_chars=30000)
+                    if not ctx:
+                        print("[Cap no encontrado]")
+                        continue
+                    print(f"\n{DIM}── Cap (ch={cap_ch}, cap={cap_idx}) ──{RESET}")
                     print(ctx)
                     print(f"{DIM}─────────────────────────{RESET}")
 
