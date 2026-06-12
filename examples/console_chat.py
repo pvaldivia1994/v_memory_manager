@@ -578,16 +578,7 @@ def main():
 
         conv_summary.maybe_update()
 
-        extra_context = ""
-        mem_count = 0
         book_chars = 0
-        if sem:
-            results = sem.search(user, n_results=3)
-            if results:
-                mem_count = len(results)
-                lines = "\n".join(f"- {m.content}" for m in results)
-                extra_context = lines
-                print(f"{DIM}[{mem_count} memorias recuperadas]{RESET}")
 
         book_context = ""
         if book_mem and book_mem.has_books():
@@ -596,15 +587,15 @@ def main():
                 book_chars = len(book_context)
                 print(f"{DIM}[{book_chars}c de contexto de libros recuperados]{RESET}")
 
-        full_system = mem.build_system_prompt(
-            extra_context=extra_context,
-            conv_summary_memory=conv_summary,
+        full_system = mem.build_system_prompt()
+        user_message = mem.build_user_message(
+            user,
             book_context=book_context,
+            semantic_memory=sem,
+            conv_summary_memory=conv_summary,
         )
-        if extra_context:
-            log.warning("System prompt con memorias (%d chars):\n%s", len(full_system), full_system)
 
-        raw = [m for m in mem.get_history(extra_context=extra_context) if m.role != "system"]
+        raw = [m for m in mem.get_history() if m.role != "system"]
         msg_ids = [m.id for m in raw]
         history = [{"role": m.role, "content": m.content} for m in raw]
         cleaned = []
@@ -620,7 +611,7 @@ def main():
         if stream:
             full = ""
             stats = None
-            for chunk in llm.chat(system=full_system, user=user, history=history, stream=True):
+            for chunk in llm.chat(system=full_system, user=user_message, history=history, stream=True):
                 if not chunk.success:
                     log.error("Stream error: %s | user=%r | system_len=%d", chunk.error, user[:100], len(full_system))
                     print(f"\n{DIM}[ERROR: {chunk.error}]{RESET}")
@@ -645,7 +636,7 @@ def main():
                     if mid2:
                         print(f"{DIM}[Memoria del asistente: {mid2}]{RESET}")
         else:
-            res = llm.chat(system=full_system, user=user, history=history, stream=False)
+            res = llm.chat(system=full_system, user=user_message, history=history, stream=False)
             if not res.success:
                 log.error("Chat error: %s | user=%r | system_len=%d | prompt_tokens=%d",
                           res.error, user[:100], len(full_system), res.prompt_tokens)

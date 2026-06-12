@@ -93,36 +93,23 @@ class MemoryManager:
         else:
             db.add_message(self._conn, role, content)
 
-    def get_history(self, max_messages: int = 10, extra_context: str = "",
-                    semantic_memory: Any = None, user_query: str = "",
-                    conv_summary_memory: Any = None,
-                    book_context: str = "") -> list[Message]:
+    def get_history(self, max_messages: int = 10) -> list[Message]:
         self._require_conn()
-        system_prompt = self.build_system_prompt(
-            extra_context=extra_context, semantic_memory=semantic_memory,
-            user_query=user_query, conv_summary_memory=conv_summary_memory,
-            book_context=book_context,
-        )
+        system_prompt = self.build_system_prompt()
         return deque.build_history(self._conn, max_messages, system_prompt)
 
     def get_system_prompt(self) -> str:
         self._require_conn()
         return db.get_prompt(self._conn, db._ACTIVE) or ""
 
-    def build_system_prompt(self, extra_context: str = "",
-                            semantic_memory: Any = None,
-                            user_query: str = "",
-                            conv_summary_memory: Any = None,
-                            book_context: str = "") -> str:
+    def build_system_prompt(self) -> str:
         self._require_conn()
-
         parts = []
 
         core = db.get_prompt(self._conn, db._ACTIVE)
         if core:
             parts.append(core)
 
-        # ── Reglas de uso de memoria (antes de las memorias) ──
         rules_lines = [
             "[USO DE MEMORIA]",
             "- USER_MEMORY describe al usuario que está conversando.",
@@ -132,7 +119,7 @@ class MemoryManager:
             "- El sliding window tiene más detalle reciente que CONVERSATION_SUMMARY.",
             "- Si CONVERSATION_SUMMARY contradice los últimos mensajes, usar los últimos mensajes.",
             "- Si USER_MEMORY contradice CONVERSATION_SUMMARY, usar USER_MEMORY.",
-            "- extra_context tiene prioridad sobre CONVERSATION_SUMMARY si contradicen.",
+            "- El contexto adicional en el mensaje del usuario tiene prioridad sobre CONVERSATION_SUMMARY si contradicen.",
             "- No tratar CONVERSATION_SUMMARY como una cita exacta; es una compresión.",
             "- Si el usuario pregunta por 'mi', 'me', 'yo', 'mis gustos', 'mi nombre' o 'mi favorito', revisa USER_MEMORY primero.",
             "- Si USER_MEMORY contiene la respuesta, responde directamente usando esa memoria.",
@@ -141,41 +128,53 @@ class MemoryManager:
         ]
         parts.append("\n".join(rules_lines))
 
-        # ── Inyección dinámica de memorias semánticas (Fase 4) ──
-        if semantic_memory and user_query:
-            try:
-                results = semantic_memory.search(user_query, n_results=5)
-                if results:
-                    lines = "\n".join(f"- {m.content}" for m in results)
-                    parts.append(f"[USER_MEMORY]\n{lines}")
-            except Exception:
-                pass  # fallback a extra_context si falla
-
-        # Legacy: long_term_memories (deprecated, migrar a semantic_memories)
-        memories = db.get_all_long_term_memories(self._conn)
-        if memories:
-            block = "\n".join(f"- {m.content}" for m in memories)
-            parts.append(f"[ASSISTANT_MEMORY]\n{block}")
-
-        # ── Resumen de continuidad conversacional ──
-        if conv_summary_memory:
-            block = conv_summary_memory.build_context_block()
-            if block:
-                parts.append(block)
-
-        # ── Contexto de libros (BookMemory) ──
-        if book_context:
-            parts.append(book_context)
-
-        if extra_context:
-            if "[USER_MEMORY]" not in "\n".join(parts):
-                parts.append("[USER_MEMORY]")
-            parts.append(extra_context)
-
         all_prompts = db.get_all_prompts_ordered(self._conn)
         extra = [(n, c, o) for n, c, o in all_prompts if n != db._ACTIVE]
         for _, content, _ in extra:
             parts.append(content)
+
+        return "\n\n".join(parts)
+
+    def build_user_message(self, user_input: str, book_context: str = "",
+                           semantic_memory: Any = None,
+                           conv_summary_memory: Any = None,
+                           extra_context: str = "") -> str:
+        parts = [user_input]
+        context_lines = []
+
+        if book_context:
+            context_lines.append(book_context)
+
+        if semantic_memory:
+            try:
+                user_mem = semantic_memory.search(user_input, n_results=3, scope="user")
+                if user_mem:
+                    lines = "\n".join(f"- {m.content}" for m in user_mem)
+                    context_lines.append(f"[USER_MEMORY]\n{lines}")
+            except Exception:
+                pass
+            try:
+                asst_mem = semantic_memory.search(user_input, n_results=3, scope="assistant")
+                if asst_mem:
+                    lines = "\n".join(f"- {m.content}" for m in asst_mem)
+                    context_lines.append(f"[ASSISTANT_MEMORY]\n{lines}")
+            except Exception:
+                pass
+
+        if conv_summary_memory:
+            try:
+                block = conv_summary_memory.build_context_block()
+                if block:
+                    context_lines.append(block)
+            except Exception:
+                pass
+
+        if extra_context:
+            context_lines.append(f"[USER_MEMORY]\n{extra_context}")
+
+        if context_lines:
+            parts.append("--- Contexto adicional ---")
+            parts.extend(context_lines)
 
         return "\n\n".join(parts)
 
