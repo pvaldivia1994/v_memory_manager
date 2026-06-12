@@ -505,7 +505,7 @@ def main():
                     except ValueError:
                         print("[El indice debe ser un numero. Usa /book chapters <book_id>]")
                         continue
-                    ctx = book_mem.build_chapter_context(ch_book_id, ch_index, max_chars=5000)
+                    ctx = book_mem.build_chapter_context(ch_book_id, ch_index, max_chars=30000)
                     if not ctx:
                         print("[Capitulo no encontrado]")
                         continue

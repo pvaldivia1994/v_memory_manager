@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS book_chunks (
     chunk_id        TEXT NOT NULL UNIQUE,
     book_id         TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
     parent_chunk_id TEXT REFERENCES book_chunks(chunk_id),
-    level           TEXT NOT NULL CHECK(level IN ('chapter', 'section')),
+    level           TEXT NOT NULL CHECK(level IN ('chapter', 'cap', 'section')),
     chapter         TEXT NOT NULL DEFAULT '',
     chapter_index   INTEGER NOT NULL DEFAULT 0,
     section_index   INTEGER NOT NULL DEFAULT 0,
@@ -135,18 +135,18 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_book_chunks_book_section ON book_chunks(bo
 CREATE INDEX IF NOT EXISTS idx_book_chunks_hash ON book_chunks(chunk_hash);
 
 CREATE TABLE IF NOT EXISTS book_chapters (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    book_id         TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
-    chapter_index   INTEGER NOT NULL,
-    title           TEXT NOT NULL DEFAULT '',
-    page_start      INTEGER NOT NULL DEFAULT 0,
-    page_end        INTEGER NOT NULL DEFAULT 0,
-    char_count      INTEGER NOT NULL DEFAULT 0,
-    chunk_count     INTEGER NOT NULL DEFAULT 0,
-    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(book_id, chapter_index)
-);"""
-
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            book_id         TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
+            chapter_index   INTEGER NOT NULL,
+            title           TEXT NOT NULL DEFAULT '',
+            page_start      INTEGER NOT NULL DEFAULT 0,
+            page_end        INTEGER NOT NULL DEFAULT 0,
+            char_count      INTEGER NOT NULL DEFAULT 0,
+            chunk_count     INTEGER NOT NULL DEFAULT 0,
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(book_id, chapter_index)
+        );
+    """;
 
 
 def _conn(db_path: str) -> sqlite3.Connection:
@@ -214,34 +214,25 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             expires_scope   TEXT NOT NULL DEFAULT 'never'
         )
     """)
-
-    # Migration: add user_id if missing (pre-v0.4.1 databases)
     sem_cols = {r[1] for r in conn.execute("PRAGMA table_info(semantic_memories)").fetchall()}
     if "user_id" not in sem_cols:
         conn.execute("ALTER TABLE semantic_memories ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'")
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS conversation_summary_state (
             conversation_id             TEXT NOT NULL,
             user_id                     TEXT NOT NULL DEFAULT 'default',
-
             summary                     TEXT NOT NULL DEFAULT '',
             last_summarized_message_id  INTEGER NOT NULL DEFAULT 0,
             last_summarized_created_at  TEXT NOT NULL DEFAULT '',
-
             summary_version             INTEGER NOT NULL DEFAULT 1,
             status                      TEXT NOT NULL DEFAULT 'active',
-
             summary_error_count         INTEGER NOT NULL DEFAULT 0,
             last_error                  TEXT NOT NULL DEFAULT '',
-
             created_at                  TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at                  TEXT NOT NULL DEFAULT (datetime('now')),
-
             PRIMARY KEY (conversation_id, user_id)
         )
     """)
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS books (
             id              TEXT PRIMARY KEY,
@@ -267,14 +258,13 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(source_file_hash, source_text_hash)
         )
     """)
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS book_chunks (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             chunk_id        TEXT NOT NULL UNIQUE,
             book_id         TEXT NOT NULL REFERENCES books(id) ON DELETE CASCADE,
             parent_chunk_id TEXT REFERENCES book_chunks(chunk_id),
-            level           TEXT NOT NULL CHECK(level IN ('chapter', 'section')),
+            level           TEXT NOT NULL CHECK(level IN ('chapter', 'cap', 'section')),
             chapter         TEXT NOT NULL DEFAULT '',
             chapter_index   INTEGER NOT NULL DEFAULT 0,
             section_index   INTEGER NOT NULL DEFAULT 0,
@@ -287,13 +277,11 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             created_at      TEXT NOT NULL DEFAULT (datetime('now'))
         )
     """)
-
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_book_id ON book_chunks(book_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_parent ON book_chunks(parent_chunk_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_book_chapter ON book_chunks(book_id, chapter_index)")
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_book_chunks_book_section ON book_chunks(book_id, chapter_index, section_index)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_hash ON book_chunks(chunk_hash)")
-
     conn.execute("""
         CREATE TABLE IF NOT EXISTS book_chapters (
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -308,7 +296,6 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
             UNIQUE(book_id, chapter_index)
         )
     """)
-
     conn.commit()
 
 

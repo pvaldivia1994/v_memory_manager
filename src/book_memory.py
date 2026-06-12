@@ -69,6 +69,14 @@ def _make_child_chunk_id(book_id: str, ch_index: int, sec_index: int) -> str:
     return f"{book_id}_ch_{ch_index:04d}_s_{sec_index:04d}"
 
 
+def _make_cap_chunk_id(book_id: str, ch_index: int, cap_index: int) -> str:
+    return f"{book_id}_ch_{ch_index:04d}_c_{cap_index:04d}"
+
+
+def _make_cap_section_chunk_id(book_id: str, ch_index: int, cap_index: int, sec_index: int) -> str:
+    return f"{book_id}_ch_{ch_index:04d}_c_{cap_index:04d}_s_{sec_index:04d}"
+
+
 def _embedding_to_blob(vector: list[float]) -> bytes:
     arr = np.array(vector, dtype=np.float32)
     return arr.tobytes()
@@ -983,11 +991,18 @@ class BookMemory:
         return chapters
 
     def _get_page_text(self, full_text: str, page_num: int) -> str:
-        """Extract the text of a specific [PAGE N] from the full extracted text."""
         pattern = re.escape(f"[PAGE {page_num}]")
         next_pattern = re.escape(f"[PAGE {page_num + 1}]")
         match = re.search(pattern + r"(.*?)(?:" + next_pattern + "|$)", full_text, re.DOTALL)
         return match.group(1).strip() if match else ""
+
+    def _get_page_range_text(self, full_text: str, from_page: int, to_page: int) -> str:
+        parts: list[str] = []
+        for p in range(from_page, to_page):
+            page_text = self._get_page_text(full_text, p)
+            if page_text:
+                parts.append(f"[PAGE {p}]\n{page_text}")
+        return "\n\n".join(parts)
 
     def _index_book_from_file(self, book_id: str, text: str, index_path: str) -> None:
         entries = self.parse_index(index_path)
@@ -997,86 +1012,89 @@ class BookMemory:
         chapters = self.group_index_entries(entries)
         total_chunks = 0
 
-        for ch_index, (ch_title, ch_page, sections) in enumerate(chapters):
-            if ch_index + 1 < len(chapters):
-                next_page = chapters[ch_index + 1][1]
-            else:
-                next_page = None
-
-            chapter_parts: list[str] = []
-            p = ch_page
-            while next_page is None or p < next_page:
-                page_text = self._get_page_text(text, p)
-                if page_text:
-                    chapter_parts.append(f"[PAGE {p}]\n{page_text}")
-                p += 1
-                if p > 200:
-                    break
-
-            chapter_text = "\n\n".join(chapter_parts) if chapter_parts else ""
+        for ch_index, (ch_title, ch_page, caps) in enumerate(chapters):
+            ch_next_page = chapters[ch_index + 1][1] if ch_index + 1 < len(chapters) else ch_page + 1
+            chapter_text = self._get_page_range_text(text, ch_page, ch_next_page)
             if not chapter_text.strip():
                 chapter_text = f"[PAGE {ch_page}]\n" + self._get_page_text(text, ch_page)
 
-            parent_chunk_id = _make_parent_chunk_id(book_id, ch_index)
-            parent_hash = _hash_text(chapter_text)
+            chapter_chunk_id = _make_parent_chunk_id(book_id, ch_index)
+            chapter_hash = _hash_text(chapter_text)
 
             db.insert_book_chunk(
-                self.conn, parent_chunk_id, book_id,
+                self.conn, chapter_chunk_id, book_id,
                 level="chapter", chapter_index=ch_index, section_index=-1,
-                chunk_text=chapter_text, chunk_hash=parent_hash,
+                chunk_text=chapter_text, chunk_hash=chapter_hash,
                 chapter=ch_title,
-                page_start=ch_page,
-                page_end=(next_page - 1) if next_page else ch_page,
+                page_start=ch_page, page_end=ch_next_page - 1,
                 embedding=None,
             )
 
-            child_sections = chunk_text(
-                chapter_text,
-                chunk_size_chars=self.chunk_size_chars,
-                chunk_overlap_chars=self.chunk_overlap_chars,
-            )
-
-            for sec_index, section in enumerate(child_sections):
-                child_chunk_id = _make_child_chunk_id(book_id, ch_index, sec_index)
-                child_hash = _hash_text(section["text"])
-
-                if db.chunk_exists_by_hash(self.conn, book_id, child_hash):
+            for cap_index, (cap_title, cap_page) in enumerate(caps):
+                cap_next_page = caps[cap_index + 1][1] if cap_index + 1 < len(caps) else ch_next_page
+                cap_text = self._get_page_range_text(text, cap_page, cap_next_page)
+                if not cap_text.strip():
                     continue
 
-                embedding_blob = self._embed(section["text"])
+                cap_chunk_id = _make_cap_chunk_id(book_id, ch_index, cap_index)
+                cap_hash = _hash_text(cap_text)
 
                 db.insert_book_chunk(
-                    self.conn, child_chunk_id, book_id,
-                    level="section", chapter_index=ch_index, section_index=sec_index,
-                    chunk_text=section["text"], chunk_hash=child_hash,
-                    parent_chunk_id=parent_chunk_id,
-                    chapter=ch_title,
-                    page_start=section["page_start"],
-                    page_end=section["page_end"],
-                    embedding=embedding_blob,
+                    self.conn, cap_chunk_id, book_id,
+                    level="cap", chapter_index=ch_index, section_index=cap_index,
+                    chunk_text=cap_text, chunk_hash=cap_hash,
+                    parent_chunk_id=chapter_chunk_id,
+                    chapter=cap_title,
+                    page_start=cap_page, page_end=cap_next_page - 1,
+                    embedding=None,
                 )
-                total_chunks += 1
+
+                cap_sections = chunk_text(
+                    cap_text,
+                    chunk_size_chars=self.chunk_size_chars,
+                    chunk_overlap_chars=self.chunk_overlap_chars,
+                )
+
+                for sec_index, section in enumerate(cap_sections):
+                    sec_chunk_id = _make_cap_section_chunk_id(book_id, ch_index, cap_index, sec_index)
+                    sec_hash = _hash_text(section["text"])
+
+                    if db.chunk_exists_by_hash(self.conn, book_id, sec_hash):
+                        continue
+
+                    embedding_blob = self._embed(section["text"])
+
+                    db.insert_book_chunk(
+                        self.conn, sec_chunk_id, book_id,
+                        level="section", chapter_index=ch_index, section_index=sec_index,
+                        chunk_text=section["text"], chunk_hash=sec_hash,
+                        parent_chunk_id=cap_chunk_id,
+                        chapter=cap_title,
+                        page_start=section["page_start"], page_end=section["page_end"],
+                        embedding=embedding_blob,
+                    )
+                    total_chunks += 1
 
         db.update_book(self.conn, book_id, status="embedding",
                        total_chapters=len(chapters),
                        total_chunks=total_chunks)
-        for ch_index, (ch_title, ch_page, _) in enumerate(chapters):
-            parent_id = _make_parent_chunk_id(book_id, ch_index)
-            row = self.conn.execute(
-                "SELECT page_start, page_end, char_count FROM book_chunks WHERE chunk_id=?", (parent_id,)
+        for ch_index, (ch_title, ch_page, caps) in enumerate(chapters):
+            ch_next_page = chapters[ch_index + 1][1] if ch_index + 1 < len(chapters) else ch_page + 1
+            pid = _make_parent_chunk_id(book_id, ch_index)
+            prow = self.conn.execute(
+                "SELECT char_count FROM book_chunks WHERE chunk_id=?", (pid,)
             ).fetchone()
+            char_count = prow["char_count"] if prow else 0
             section_count = self.conn.execute(
                 "SELECT COUNT(*) FROM book_chunks WHERE book_id=? AND chapter_index=? AND level='section'",
                 (book_id, ch_index),
             ).fetchone()[0]
-            next_page = chapters[ch_index + 1][1] if ch_index + 1 < len(chapters) else ch_page
-            if row:
-                db.upsert_book_chapter(
-                    self.conn, book_id, ch_index,
-                    title=ch_title,
-                    page_start=ch_page, page_end=next_page - 1,
-                    char_count=row["char_count"], chunk_count=section_count,
-                )
+            db.upsert_book_chapter(
+                self.conn, book_id, ch_index,
+                title=ch_title,
+                page_start=ch_page, page_end=ch_next_page - 1,
+                char_count=char_count, chunk_count=section_count,
+            )
 
     # ── Search ──────────────────────────────────────────────────
 
