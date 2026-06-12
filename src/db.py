@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS book_chunks (
 CREATE INDEX IF NOT EXISTS idx_book_chunks_book_id ON book_chunks(book_id);
 CREATE INDEX IF NOT EXISTS idx_book_chunks_parent ON book_chunks(parent_chunk_id);
 CREATE INDEX IF NOT EXISTS idx_book_chunks_book_chapter ON book_chunks(book_id, chapter_index);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_book_chunks_book_section ON book_chunks(book_id, chapter_index, section_index);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_book_chunks_book_section ON book_chunks(book_id, chapter_index, level, section_index);
 CREATE INDEX IF NOT EXISTS idx_book_chunks_hash ON book_chunks(chunk_hash);
 
 CREATE TABLE IF NOT EXISTS book_chapters (
@@ -280,7 +280,7 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_book_id ON book_chunks(book_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_parent ON book_chunks(parent_chunk_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_book_chapter ON book_chunks(book_id, chapter_index)")
-    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_book_chunks_book_section ON book_chunks(book_id, chapter_index, section_index)")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_book_chunks_book_section ON book_chunks(book_id, chapter_index, level, section_index)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book_chunks_hash ON book_chunks(chunk_hash)")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS book_chapters (

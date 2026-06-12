@@ -986,8 +986,12 @@ class BookMemory:
             elif current_chapter is not None:
                 current_chapter[2].append((title, page))
             else:
-                current_chapter = (title, page, [])
+                chapter_name = entries[0][0]
+                chapter_page = entries[0][1]
+                current_chapter = (chapter_name, chapter_page, [])
                 chapters.append(current_chapter)
+                if title != chapter_name:
+                    current_chapter[2].append((title, page))
         return chapters
 
     def _get_page_text(self, full_text: str, page_num: int) -> str:
@@ -998,7 +1002,8 @@ class BookMemory:
 
     def _get_page_range_text(self, full_text: str, from_page: int, to_page: int) -> str:
         parts: list[str] = []
-        for p in range(from_page, to_page):
+        end = max(to_page, from_page + 1)
+        for p in range(from_page, end):
             page_text = self._get_page_text(full_text, p)
             if page_text:
                 parts.append(f"[PAGE {p}]\n{page_text}")
@@ -1030,8 +1035,10 @@ class BookMemory:
                 embedding=None,
             )
 
-            for cap_index, (cap_title, cap_page) in enumerate(caps):
-                cap_next_page = caps[cap_index + 1][1] if cap_index + 1 < len(caps) else ch_next_page
+            all_caps: list[tuple[str, int]] = [(ch_title, ch_page)] + caps
+
+            for cap_index, (cap_title, cap_page) in enumerate(all_caps):
+                cap_next_page = all_caps[cap_index + 1][1] if cap_index + 1 < len(all_caps) else ch_next_page
                 cap_text = self._get_page_range_text(text, cap_page, cap_next_page)
                 if not cap_text.strip():
                     continue
