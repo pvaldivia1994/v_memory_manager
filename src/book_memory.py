@@ -1255,23 +1255,28 @@ class BookMemory:
 
         placeholders = ",".join("?" * len(parent_ids))
         parents = self.conn.execute(f"""
-            SELECT chunk_id, chapter, chunk_text, page_start, page_end, char_count
+            SELECT chunk_id, chapter, chunk_text, page_start, page_end, char_count, level
             FROM book_chunks WHERE chunk_id IN ({placeholders})
         """, parent_ids).fetchall()
 
-        child_dict = [
-            {"parent_chunk_id": c.parent_chunk_id, "chunk_text": c.text,
-             "page_start": c.page_start, "page_end": c.page_end}
-            for c in chunks
-        ]
-
         context_parts = []
+        chars_used = 0
         for p in parents:
-            parent_dict = dict(p)
-            p_max = max_chars // len(parents)
-            truncated = self.truncate_centered(parent_dict, child_dict, p_max)
-            header = f"## {parent_dict['chapter']} (pag {parent_dict['page_start']}-{parent_dict['page_end']})"
-            context_parts.append(f"{header}\n{truncated}")
+            pd = dict(p)
+            if pd["level"] == "cap":
+                text = pd["chunk_text"]
+                if chars_used + len(text) <= max_chars:
+                    context_parts.append(f"## {pd['chapter']} (pag {pd['page_start']}-{pd['page_end']})\n{text}")
+                    chars_used += len(text)
+            else:
+                child_texts = [c.text for c in chunks if c.parent_chunk_id == pd["chunk_id"]]
+                combined = "\n\n".join(child_texts) if child_texts else pd["chunk_text"]
+                if chars_used + len(combined) <= max_chars:
+                    context_parts.append(f"## {pd['chapter']} (pag {pd['page_start']}-{pd['page_end']})\n{combined}")
+                    chars_used += len(combined)
+
+        if not context_parts:
+            return ""
 
         context = "\n\n".join(context_parts)
         return f"[BOOK_CONTEXT: {book_title}]\n{context}\n[/BOOK_CONTEXT]"
