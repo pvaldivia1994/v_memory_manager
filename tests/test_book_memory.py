@@ -148,7 +148,7 @@ Falling in a dream is a common trigger for a kick."""
     print(f"[OK] search: {len(results)} results")
 
     context = bm.build_context("how does the kick mechanism work", book_id=book_id, max_chars=2000)
-    assert "[BOOK_CONTEXT]" in context
+    assert context.startswith("[BOOK_CONTEXT")
     print(f"[OK] build_context: {len(context)} chars")
 
     context_unknown = bm.build_context("xyznonexistentcontent12345", book_id=book_id, max_chars=2000)

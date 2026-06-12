@@ -652,7 +652,7 @@ class BookMemory:
         user_id: str = "default",
         chunk_size_chars: int = 800,
         chunk_overlap_chars: int = 150,
-        search_max_distance: float = 0.75,
+        search_max_distance: float = 0.45,
         embedding_dim: int = 0,
     ):
         self._conn = sqlite_conn
@@ -1238,6 +1238,12 @@ class BookMemory:
             books = db.list_books(self.conn, user_id=self._user_id)
             if books:
                 book_id = books[0]["id"]
+            else:
+                return ""
+
+        book = db.get_book(self.conn, book_id)
+        book_title = book["title"] if book else ""
+
         chunks = self.search(
             query, n_results=n_results, book_id=book_id,
             max_distance=max_distance,
@@ -1251,12 +1257,13 @@ class BookMemory:
 
         placeholders = ",".join("?" * len(parent_ids))
         parents = self.conn.execute(f"""
-            SELECT chunk_id, chapter, chunk_text, char_count
+            SELECT chunk_id, chapter, chunk_text, page_start, page_end, char_count
             FROM book_chunks WHERE chunk_id IN ({placeholders})
         """, parent_ids).fetchall()
 
         child_dict = [
-            {"parent_chunk_id": c.parent_chunk_id, "chunk_text": c.text}
+            {"parent_chunk_id": c.parent_chunk_id, "chunk_text": c.text,
+             "page_start": c.page_start, "page_end": c.page_end}
             for c in chunks
         ]
 
@@ -1265,10 +1272,11 @@ class BookMemory:
             parent_dict = dict(p)
             p_max = max_chars // len(parents)
             truncated = self.truncate_centered(parent_dict, child_dict, p_max)
-            context_parts.append(f"## {parent_dict['chapter']}\n{truncated}")
+            header = f"## {parent_dict['chapter']} (pag {parent_dict['page_start']}-{parent_dict['page_end']})"
+            context_parts.append(f"{header}\n{truncated}")
 
         context = "\n\n".join(context_parts)
-        return f"[BOOK_CONTEXT]\n{context}\n[/BOOK_CONTEXT]"
+        return f"[BOOK_CONTEXT: {book_title}]\n{context}\n[/BOOK_CONTEXT]"
 
     # ── Chapter reading ─────────────────────────────────────────
 
