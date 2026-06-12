@@ -1039,22 +1039,18 @@ class BookMemory:
 
             for cap_index, (cap_title, cap_page) in enumerate(all_caps):
                 cap_next_page = all_caps[cap_index + 1][1] if cap_index + 1 < len(all_caps) else ch_next_page
-                cap_text = self._get_page_range_text(text, cap_page, cap_next_page)
+                cap_marker = f"[PAGE {cap_page}]"
+                if cap_next_page and cap_next_page > cap_page:
+                    next_marker = f"[PAGE {cap_next_page}]"
+                    cap_match = re.search(re.escape(cap_marker) + r"(.*?)(?:" + re.escape(next_marker) + "|$)", text, re.DOTALL)
+                else:
+                    cap_match = re.search(re.escape(cap_marker) + r"(.*)", text, re.DOTALL)
+                cap_text = cap_match.group(1).strip() if cap_match else ""
                 if not cap_text.strip():
                     continue
 
                 cap_chunk_id = _make_cap_chunk_id(book_id, ch_index, cap_index)
                 cap_hash = _hash_text(cap_text)
-
-                db.insert_book_chunk(
-                    self.conn, cap_chunk_id, book_id,
-                    level="cap", chapter_index=ch_index, section_index=cap_index,
-                    chunk_text=cap_text, chunk_hash=cap_hash,
-                    parent_chunk_id=chapter_chunk_id,
-                    chapter=cap_title,
-                    page_start=cap_page, page_end=cap_next_page - 1,
-                    embedding=None,
-                )
 
                 cap_sections = chunk_text(
                     cap_text,
@@ -1062,6 +1058,8 @@ class BookMemory:
                     chunk_overlap_chars=self.chunk_overlap_chars,
                 )
 
+                sec_start = cap_page
+                sec_end = cap_page
                 for sec_index, section in enumerate(cap_sections):
                     sec_chunk_id = _make_cap_section_chunk_id(book_id, ch_index, cap_index, sec_index)
                     sec_hash = _hash_text(section["text"])
@@ -1075,12 +1073,25 @@ class BookMemory:
                         self.conn, sec_chunk_id, book_id,
                         level="section", chapter_index=ch_index, section_index=sec_index,
                         chunk_text=section["text"], chunk_hash=sec_hash,
-                        parent_chunk_id=cap_chunk_id,
+                        parent_chunk_id=chapter_chunk_id,
                         chapter=cap_title,
                         page_start=section["page_start"], page_end=section["page_end"],
                         embedding=embedding_blob,
                     )
                     total_chunks += 1
+                    sec_start = min(sec_start, section["page_start"])
+                    sec_end = max(sec_end, section["page_end"])
+
+                cap_text_combined = "\n\n".join(s["text"] for s in cap_sections)
+                db.insert_book_chunk(
+                    self.conn, cap_chunk_id, book_id,
+                    level="cap", chapter_index=ch_index, section_index=cap_index,
+                    chunk_text=cap_text_combined, chunk_hash=_hash_text(cap_text_combined),
+                    parent_chunk_id=chapter_chunk_id,
+                    chapter=cap_title,
+                    page_start=sec_start, page_end=sec_end,
+                    embedding=None,
+                )
 
         db.update_book(self.conn, book_id, status="embedding",
                        total_chapters=len(chapters),
