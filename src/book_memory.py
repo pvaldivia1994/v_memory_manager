@@ -1222,9 +1222,7 @@ class BookMemory:
             e = parent_text.rfind(" ", 0, end)
             end = e if e != -1 else end
 
-        prefix = "[...]" if start > 0 else ""
-        suffix = "[...]" if end < len(parent_text) else ""
-        return f"{prefix}{parent_text[start:end]}{suffix}"
+        return parent_text[start:end]
 
     def build_context(
         self,
@@ -1314,7 +1312,7 @@ class BookMemory:
 
         truncated = text[:max_chars]
         truncated = truncated[:truncated.rfind(" ")]
-        return f"[BOOK_CONTEXT]\n## {chapter['chapter']}\n{truncated}[...]\n[/BOOK_CONTEXT]"
+        return f"[BOOK_CONTEXT]\n## {chapter['chapter']}\n{truncated}\n[/BOOK_CONTEXT]"
 
     def list_caps(self, book_id: str) -> list[dict]:
         rows = self.conn.execute("""
@@ -1344,7 +1342,7 @@ class BookMemory:
             return f"[BOOK_CONTEXT]\n## {cap['chapter']}\n{text}\n[/BOOK_CONTEXT]"
         truncated = text[:max_chars]
         truncated = truncated[:truncated.rfind(" ")]
-        return f"[BOOK_CONTEXT]\n## {cap['chapter']}\n{truncated}[...]\n[/BOOK_CONTEXT]"
+        return f"[BOOK_CONTEXT]\n## {chapter['chapter']}\n{truncated}\n[/BOOK_CONTEXT]"
 
     # ── Multilanguage handling ──────────────────────────────────
 

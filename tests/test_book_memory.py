@@ -282,11 +282,11 @@ This is the last paragraph before the next chapter."""
     ]
 
     result = bm.truncate_centered(chapter, child_rows, max_chars=200)
-    assert "[...]" in result
-    print(f"[OK] truncate_centered: {len(result)} chars, has markers")
+    assert len(result) <= 250
+    print(f"[OK] truncate_centered: {len(result)} chars (truncated)")
 
     full = bm.truncate_centered(chapter, child_rows, max_chars=10000)
-    assert "[...]" not in full
+    assert len(full) > 250
     print(f"[OK] truncate_centered no truncation: {len(full)} chars")
 
     bm.delete_book(book_id)
