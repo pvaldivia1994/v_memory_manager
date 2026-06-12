@@ -578,6 +578,7 @@ def main():
 
         conv_summary.maybe_update()
 
+        mem_count = 0
         book_chars = 0
 
         book_context = ""
