@@ -1249,31 +1249,17 @@ class BookMemory:
         if not chunks:
             return ""
 
-        parent_ids = list(set(c.parent_chunk_id for c in chunks if c.parent_chunk_id))
-        if not parent_ids:
-            return ""
-
-        placeholders = ",".join("?" * len(parent_ids))
-        parents = self.conn.execute(f"""
-            SELECT chunk_id, chapter, chunk_text, page_start, page_end, char_count, level
-            FROM book_chunks WHERE chunk_id IN ({placeholders})
-        """, parent_ids).fetchall()
-
         context_parts = []
         chars_used = 0
-        for p in parents:
-            pd = dict(p)
-            if pd["level"] == "cap":
-                text = pd["chunk_text"]
-                if chars_used + len(text) <= max_chars:
-                    context_parts.append(f"## {pd['chapter']} (pag {pd['page_start']}-{pd['page_end']})\n{text}")
-                    chars_used += len(text)
-            else:
-                child_texts = [c.text for c in chunks if c.parent_chunk_id == pd["chunk_id"]]
-                combined = "\n\n".join(child_texts) if child_texts else pd["chunk_text"]
-                if chars_used + len(combined) <= max_chars:
-                    context_parts.append(f"## {pd['chapter']} (pag {pd['page_start']}-{pd['page_end']})\n{combined}")
-                    chars_used += len(combined)
+        for c in chunks:
+            entry = f"{c.text.strip()}"
+            if chars_used + len(entry) <= max_chars:
+                chapter_label = c.chapter if c.chapter else book_title
+                header = f"## {chapter_label}"
+                if c.page_start:
+                    header += f" (pag {c.page_start})"
+                context_parts.append(f"{header}\n{entry}")
+                chars_used += len(entry)
 
         if not context_parts:
             return ""
