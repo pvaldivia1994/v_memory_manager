@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import shutil
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 logging.basicConfig(
@@ -14,6 +16,45 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("chat")
+
+_CONVO_LOG = Path("conversation.log")
+
+
+def _log_conversation(system: str, user: str, history: list[dict],
+                       response: str, stats) -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sep = "=" * 60
+    with _CONVO_LOG.open("a", encoding="utf-8") as f:
+        f.write(f"\n{sep}\n")
+        f.write(f"=== Turno: {ts} ===\n")
+        f.write(f"{sep}\n\n")
+
+        f.write("── SYSTEM PROMPT ──\n")
+        f.write(system)
+        f.write("\n\n")
+
+        if history:
+            f.write("── HISTORY ──\n")
+            for m in history:
+                f.write(f"[{m['role']}]\n{m['content']}\n\n")
+            f.write("\n")
+
+        f.write("── USER MESSAGE ──\n")
+        f.write(user)
+        f.write("\n\n")
+
+        f.write("── ASSISTANT RESPONSE ──\n")
+        f.write(response)
+        f.write("\n\n")
+
+        if stats:
+            f.write(f"Stats: {stats.duration_ms}ms | "
+                    f"{stats.tokens_per_second} tok/s | "
+                    f"prompt={stats.prompt_tokens} | "
+                    f"completion={stats.completion_tokens} | "
+                    f"total={stats.prompt_tokens + stats.completion_tokens} | "
+                    f"context={stats.context_remaining}/{stats.context_limit}\n")
+        f.write(f"{sep}\n")
 
 _ROOT = Path(__file__).resolve().parent.parent
 _VLLAMA = _ROOT.parent / "v_llama"
@@ -147,7 +188,17 @@ def _ask_system_prompt(mem: MemoryManager) -> str:
         print("  El prompt no puede estar vacío.")
 
 
+def _log_session_start() -> None:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    sep = "=" * 60
+    with _CONVO_LOG.open("a", encoding="utf-8") as f:
+        f.write(f"\n{sep}\n")
+        f.write(f"=== SESION INICIADA: {ts} ===\n")
+        f.write(f"{sep}\n")
+
+
 def main():
+    _log_session_start()
     import argparse
 
     parser = argparse.ArgumentParser(description="Chat por consola con v_llama + v_memory_manager")
@@ -629,6 +680,7 @@ def main():
             if full:
                 mem.add_message("user", user)
                 mem.add_message("assistant", full)
+                _log_conversation(full_system, user_message, history, full, stats)
                 if sem:
                     mid = sem.remember(user)
                     if mid:
@@ -651,6 +703,7 @@ def main():
                 if res.content:
                     mem.add_message("user", user)
                     mem.add_message("assistant", res.content)
+                    _log_conversation(full_system, user_message, history, res.content, res)
                     if sem:
                         mid = sem.remember(user)
                         if mid:
