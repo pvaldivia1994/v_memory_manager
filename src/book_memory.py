@@ -1322,12 +1322,12 @@ class BookMemory:
         top_k = min(candidate_chunks, len(valid_idx))
         top_indices = valid_idx[np.argsort(-similarities[valid_idx])[:top_k]]
 
-        grouped: dict[tuple[int, str], list[tuple[float, BookChunk]]] = {}
+        grouped: dict[str, list[tuple[float, BookChunk]]] = {}
         for idx in top_indices:
             info = infos[idx]
             similarity = float(similarities[idx])
             cap_title = info["chapter"] or "Sin título"
-            cap_key = (info["chapter_index"], cap_title)
+            cap_key = info["parent_chunk_id"] or f"{info['chapter_index']}:{cap_title}"
             chunk = BookChunk(
                 chunk_id=info["chunk_id"], book_id=book_id,
                 parent_chunk_id=info["parent_chunk_id"],
@@ -1340,25 +1340,28 @@ class BookMemory:
             grouped.setdefault(cap_key, []).append((similarity, chunk))
 
         cap_results = []
-        for (chapter_index, cap_title), items in grouped.items():
+        for cap_key, items in grouped.items():
             items.sort(key=lambda x: x[0], reverse=True)
+            first_chunk = items[0][1]
+            cap_title = first_chunk.chapter or "Sin título"
+            chapter_index = first_chunk.chapter_index
             sims = [s for s, _ in items]
             best_sim = sims[0]
             top3_avg = sum(sims[:3]) / min(3, len(sims))
-            hit_bonus = min(len(items), 10) * 0.02
-            score = (best_sim * 0.65) + (top3_avg * 0.25) + hit_bonus
+            hit_bonus = min(len(items), 5) * 0.01
+            score = (best_sim * 0.70) + (top3_avg * 0.25) + hit_bonus
             selected = [chunk for _, chunk in items[:chunks_per_cap]]
-            page_start = min(c.page_start for c in selected if c.page_start)
-            page_end = max(c.page_end for c in selected if c.page_end)
+            ps = [c.page_start for c in selected if c.page_start]
+            pe = [c.page_end for c in selected if c.page_end]
             cap_results.append({
-                "cap_key": f"{chapter_index}:{cap_title}",
+                "cap_key": cap_key,
                 "title": cap_title,
                 "chapter_index": chapter_index,
                 "score": score,
                 "best_similarity": best_sim,
                 "hits": len(items),
-                "page_start": page_start,
-                "page_end": page_end,
+                "page_start": min(ps) if ps else 0,
+                "page_end": max(pe) if pe else 0,
                 "chunks": selected,
             })
 
@@ -1372,6 +1375,7 @@ class BookMemory:
         max_chars: int = 3000,
         top_caps: int = 3,
         chunks_per_cap: int = 3,
+        candidate_chunks: int = 40,
         min_similarity: Optional[float] = None,
     ) -> str:
         if not book_id:
@@ -1386,7 +1390,7 @@ class BookMemory:
 
         caps = self.search_relevant_caps(
             query=query, book_id=book_id,
-            candidate_chunks=40, top_caps=top_caps,
+            candidate_chunks=candidate_chunks, top_caps=top_caps,
             chunks_per_cap=chunks_per_cap,
             min_similarity=min_similarity,
         )
@@ -1406,6 +1410,9 @@ class BookMemory:
                     break
                 if len(text) > remaining:
                     text = text[:remaining]
+                    cut = text.rfind(" ")
+                    if cut > 200:
+                        text = text[:cut]
                 chunk_texts.append(text)
                 chars_used += len(text)
 
