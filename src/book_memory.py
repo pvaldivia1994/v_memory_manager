@@ -1073,7 +1073,7 @@ class BookMemory:
                         self.conn, sec_chunk_id, book_id,
                         level="section", chapter_index=ch_index, section_index=sec_index,
                         chunk_text=section["text"], chunk_hash=sec_hash,
-                        parent_chunk_id=chapter_chunk_id,
+                        parent_chunk_id=cap_chunk_id,
                         chapter=cap_title,
                         page_start=section["page_start"], page_end=section["page_end"],
                         embedding=embedding_blob,
@@ -1286,6 +1286,139 @@ class BookMemory:
 
         context = "\n\n".join(context_parts)
         return f"[BOOK_CONTEXT: {book_title}]\n{context}\n[/BOOK_CONTEXT]"
+
+    # ── Relevant caps search ─────────────────────────────────────
+
+    def search_relevant_caps(
+        self,
+        query: str,
+        book_id: Optional[str] = None,
+        candidate_chunks: int = 40,
+        top_caps: int = 3,
+        chunks_per_cap: int = 3,
+        min_similarity: Optional[float] = None,
+    ) -> list[dict]:
+        if not book_id:
+            books = db.list_books(self.conn, user_id=self._user_id)
+            if not books:
+                return []
+            book_id = books[0]["id"]
+
+        query_vector = self._embed(query)
+        if query_vector is None:
+            return []
+
+        query_vec = _blob_to_embedding(query_vector)
+        infos, vectors = self._load_section_embeddings(book_id)
+        if not infos:
+            return []
+
+        similarities = np.array([_cosine_similarity(query_vec, v) for v in vectors])
+        threshold = min_similarity if min_similarity is not None else self.search_max_distance
+        valid_idx = np.where(similarities >= threshold)[0]
+        if len(valid_idx) == 0:
+            return []
+
+        top_k = min(candidate_chunks, len(valid_idx))
+        top_indices = valid_idx[np.argsort(-similarities[valid_idx])[:top_k]]
+
+        grouped: dict[tuple[int, str], list[tuple[float, BookChunk]]] = {}
+        for idx in top_indices:
+            info = infos[idx]
+            similarity = float(similarities[idx])
+            cap_title = info["chapter"] or "Sin título"
+            cap_key = (info["chapter_index"], cap_title)
+            chunk = BookChunk(
+                chunk_id=info["chunk_id"], book_id=book_id,
+                parent_chunk_id=info["parent_chunk_id"],
+                level="section", chapter=cap_title,
+                chapter_index=info["chapter_index"],
+                page_start=info["page_start"], page_end=info["page_end"],
+                text=info["chunk_text"], char_count=info["char_count"],
+                distance=1.0 - similarity,
+            )
+            grouped.setdefault(cap_key, []).append((similarity, chunk))
+
+        cap_results = []
+        for (chapter_index, cap_title), items in grouped.items():
+            items.sort(key=lambda x: x[0], reverse=True)
+            sims = [s for s, _ in items]
+            best_sim = sims[0]
+            top3_avg = sum(sims[:3]) / min(3, len(sims))
+            hit_bonus = min(len(items), 10) * 0.02
+            score = (best_sim * 0.65) + (top3_avg * 0.25) + hit_bonus
+            selected = [chunk for _, chunk in items[:chunks_per_cap]]
+            page_start = min(c.page_start for c in selected if c.page_start)
+            page_end = max(c.page_end for c in selected if c.page_end)
+            cap_results.append({
+                "cap_key": f"{chapter_index}:{cap_title}",
+                "title": cap_title,
+                "chapter_index": chapter_index,
+                "score": score,
+                "best_similarity": best_sim,
+                "hits": len(items),
+                "page_start": page_start,
+                "page_end": page_end,
+                "chunks": selected,
+            })
+
+        cap_results.sort(key=lambda x: x["score"], reverse=True)
+        return cap_results[:top_caps]
+
+    def build_context_by_relevant_caps(
+        self,
+        query: str,
+        book_id: Optional[str] = None,
+        max_chars: int = 3000,
+        top_caps: int = 3,
+        chunks_per_cap: int = 3,
+        min_similarity: Optional[float] = None,
+    ) -> str:
+        if not book_id:
+            books = db.list_books(self.conn, user_id=self._user_id)
+            if books:
+                book_id = books[0]["id"]
+            else:
+                return ""
+
+        book = db.get_book(self.conn, book_id)
+        book_title = book["title"] if book else ""
+
+        caps = self.search_relevant_caps(
+            query=query, book_id=book_id,
+            candidate_chunks=40, top_caps=top_caps,
+            chunks_per_cap=chunks_per_cap,
+            min_similarity=min_similarity,
+        )
+        if not caps:
+            return ""
+
+        context_parts = []
+        chars_used = 0
+        for cap in caps:
+            chunk_texts = []
+            for chunk in cap["chunks"]:
+                text = chunk.text.strip()
+                if not text:
+                    continue
+                remaining = max_chars - chars_used
+                if remaining <= 0:
+                    break
+                if len(text) > remaining:
+                    text = text[:remaining]
+                chunk_texts.append(text)
+                chars_used += len(text)
+
+            if not chunk_texts:
+                continue
+            header = f"## {cap['title']} (score {cap['score']:.2f})"
+            context_parts.append(header + "\n" + "\n\n".join(chunk_texts))
+            if chars_used >= max_chars:
+                break
+
+        if not context_parts:
+            return ""
+        return f"[BOOK_CONTEXT: {book_title}]\n" + "\n\n".join(context_parts) + "\n[/BOOK_CONTEXT]"
 
     # ── Chapter reading ─────────────────────────────────────────
 

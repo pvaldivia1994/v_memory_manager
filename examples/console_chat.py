@@ -634,7 +634,7 @@ def main():
 
         book_context = ""
         if book_mem and book_mem.has_books():
-            book_context = book_mem.build_context(user, n_results=3, max_chars=3000)
+            book_context = book_mem.build_context_by_relevant_caps(user, max_chars=3000)
             if book_context:
                 book_chars = len(book_context)
                 print(f"{DIM}[{book_chars}c de contexto de libros recuperados]{RESET}")
